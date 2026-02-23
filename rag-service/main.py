@@ -6,13 +6,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
-from dotenv import load_dotenv
+from langchain_core.prompts import PromptTemplate
 from groq import Groq
+from dotenv import load_dotenv
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 import os
 import re
 import uvicorn
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+import time
 
 load_dotenv()
 
@@ -24,8 +26,8 @@ app.state.limiter = limiter
 # GROQ CLIENT SETUP
 # ---------------------------------------------------------------------------
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
+GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 if not GROQ_API_KEY:
     raise RuntimeError(
@@ -35,11 +37,11 @@ if not GROQ_API_KEY:
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Temporary global variables
-vectorstore = None
-qa_chain = False
+# Session management for isolated vectorstores
+sessions = {}
+SESSION_TIMEOUT = 3600  # 1 hour
 
-# Load local embedding model (unchanged — FAISS retrieval stays the same)
+# Load local embedding model
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 
@@ -51,13 +53,6 @@ def normalize_spaced_text(text: str) -> str:
     """
     Fixes character-level spaced text produced by PyPDFLoader on certain
     vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
-
-    Examples:
-        'J A I N I   S O L A N K I'  ->  'JAINI SOLANKI'
-        'I B M'                       ->  'IBM'
-        'N P T E L'                   ->  'NPTEL'
-
-    Normal multi-letter words are left completely untouched.
     """
     def fix_spaced_word(match):
         return match.group(0).replace(" ", "")
@@ -69,42 +64,71 @@ def normalize_spaced_text(text: str) -> str:
 
 def normalize_answer(text: str) -> str:
     """
-    Post-processes the LLM-generated answer:
-    - Removes any residual character-level spacing.
-    - Strips prompt leakage (lines starting with 'Answer', 'Context', etc.)
-    - Collapses excessive whitespace.
+    Post-processes the LLM-generated answer.
     """
-    # Remove residual character spacing in the answer itself
     text = normalize_spaced_text(text)
-    # Strip any prompt-leakage prefixes the model might echo
-    text = re.sub(r'^(Answer[^:]*:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
-    # Collapse multiple spaces/newlines
+    # Strip only clear prompt-echo artefacts at the very start
+    text = re.sub(r'^(Final Answer:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
     text = re.sub(r'[ \t]{2,}', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
 # ---------------------------------------------------------------------------
-# GROQ-BASED RESPONSE GENERATION
+# CCC PROMPT TEMPLATE (Connect – Content – Continue)
 # ---------------------------------------------------------------------------
 
-def generate_response(prompt: str, max_new_tokens: int = 512) -> str:
+_CCC_SYSTEM = (
+    "You are an intelligent PDF Question Answering Assistant.\n"
+    "Your task is to answer the user's question strictly using the provided context "
+    "retrieved from uploaded documents.\n\n"
+    "Follow the CCC communication structure in a SINGLE response:\n\n"
+    "1. Context Connection — Start with a short professional greeting (e.g. \"Hello,\").\n"
+    "2. Content Explanation — Rewrite the retrieved context in clear, meaningful, "
+    "grammatically correct sentences. Do NOT copy text directly.\n"
+    "3. Core Answer — Present the main explanation in a structured, readable format.\n"
+    "4. Call to Action — End with a relevant follow-up question to encourage further exploration.\n\n"
+    "Rules:\n"
+    "- Use ONLY the provided context. Do NOT add external knowledge.\n"
+    "- If the answer is not in the context, say: "
+    "\"The uploaded document does not contain sufficient information to answer this question.\"\n"
+    "- Maintain a clear, professional tone.\n"
+    "- Produce one continuous response — no bullet headers like '1.' or '2.'."
+)
+
+_CCC_USER_TEMPLATE = """\
+Context from the uploaded PDF:
+{context}
+
+Question:
+{question}
+
+Final Answer:"""
+
+CCC_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=_CCC_USER_TEMPLATE,
+)
+
+
+# ---------------------------------------------------------------------------
+# GROQ GENERATION
+# ---------------------------------------------------------------------------
+
+def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
     """
-    Sends the prompt to the Groq API using the configured llama-3.3-70b-versatile
-    model and returns the generated text.
+    Calls the Groq chat-completions API with a system + user message pair.
     """
-    chat_completion = groq_client.chat.completions.create(
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
+    completion = groq_client.chat.completions.create(
         model=GROQ_MODEL,
-        max_tokens=max_new_tokens,
-        temperature=0.2,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.3,     # low temp = factual, grounded answers
     )
-    return chat_completion.choices[0].message.content.strip()
+    return completion.choices[0].message.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -113,14 +137,24 @@ def generate_response(prompt: str, max_new_tokens: int = 512) -> str:
 
 class PDFPath(BaseModel):
     filePath: str
+    session_id: str
 
 class AskRequest(BaseModel):
     question: str
+    session_id: str
     history: list = []
 
-
 class SummarizeRequest(BaseModel):
+    session_id: str
     pdf: str | None = None
+
+
+def cleanup_expired_sessions():
+    """Removes sessions that haven't been accessed for over SESSION_TIMEOUT seconds."""
+    current_time = time.time()
+    expired = [sid for sid, data in sessions.items() if current_time - data["last_accessed"] > SESSION_TIMEOUT]
+    for sid in expired:
+        del sessions[sid]
 
 
 # ---------------------------------------------------------------------------
@@ -130,25 +164,27 @@ class SummarizeRequest(BaseModel):
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
 def process_pdf(request: Request, data: PDFPath):
-    global vectorstore, qa_chain
+    cleanup_expired_sessions()
 
-    loader = PyPDFLoader(data.filePath)
+    loader   = PyPDFLoader(data.filePath)
     raw_docs = loader.load()
 
-    # ── Layer 1: normalize at ingestion ──────────────────────────────────────
-    # Clean each page's text before chunking so embeddings are on real words.
+    # Layer 1: normalize at ingestion so embeddings are on real words
     cleaned_docs = []
     for doc in raw_docs:
         cleaned_content = normalize_spaced_text(doc.page_content)
         cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_documents(cleaned_docs)
+    chunks   = splitter.split_documents(cleaned_docs)
     if not chunks:
         return {"error": "No text chunks generated from the PDF. Please check your file."}
 
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
-    qa_chain = True
+    # Store a FRESH vectorstore for this session (overwrites any previous one)
+    sessions[data.session_id] = {
+        "vectorstore": FAISS.from_documents(chunks, embedding_model),
+        "last_accessed": time.time()
+    }
 
     return {"message": "PDF processed successfully"}
 
@@ -156,47 +192,54 @@ def process_pdf(request: Request, data: PDFPath):
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
 def ask_question(request: Request, data: AskRequest):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"answer": "Please upload a PDF first!"}
+    cleanup_expired_sessions()
+
+    session_data = sessions.get(data.session_id)
+    if not session_data:
+        return {"answer": "Session expired or no PDF uploaded for this session!"}
+
+    session_data["last_accessed"] = time.time()
+    vectorstore = session_data["vectorstore"]  # Retrieve session-specific store
+
     question = data.question
-    history = data.history
+    history  = data.history
+
+    # Build conversation context from last 5 turns
     conversation_context = ""
-    # Use only last 5 messages to avoid long prompts
     for msg in history[-5:]:
-        role = msg.get("role", "")
+        role    = msg.get("role", "")
         content = msg.get("content", "")
         conversation_context += f"{role}: {content}\n"
+
+    # Retrieve relevant chunks from the SESSION vectorstore
     docs = vectorstore.similarity_search(question, k=4)
     if not docs:
-        return {"answer": "No relevant context found."}
+        return {"answer": "No relevant context found in the uploaded document."}
 
-    # ── Layer 2a: context is already clean (normalized at ingestion) ──────────
+    # Context is already clean (normalized at ingestion)
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = f"""
-    You are a helpful assistant answering questions from a PDF document.
+    # Merge conversation history into the question slot
+    question_with_history = question
+    if conversation_context.strip():
+        question_with_history = (
+            f"Conversation so far:\n{conversation_context.strip()}\n\n"
+            f"Current Question: {question}"
+        )
 
-    Conversation History:
-    {conversation_context}
+    # Build user turn from CCC template
+    user_prompt = CCC_PROMPT.format(
+        context=context,
+        question=question_with_history,
+    )
 
-    Document Context:
-    {context}
+    raw_answer = generate_response(
+        system_prompt=_CCC_SYSTEM,
+        user_prompt=user_prompt,
+        max_tokens=600,
+    )
 
-    Current Question:
-    {question}
-
-    Instructions:
-    - Use the document context to answer.
-    - If the answer is not in the document, say so briefly.
-    - Keep the answer concise.
-
-    Answer:
-    """
-
-    raw_answer = generate_response(prompt, max_new_tokens=512)
-
-    # ── Layer 3: post-process the answer itself ───────────────────────────────
+    # Post-process the answer itself
     answer = normalize_answer(raw_answer)
     return {"answer": answer}
 
@@ -204,30 +247,39 @@ def ask_question(request: Request, data: AskRequest):
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
 def summarize_pdf(request: Request, data: SummarizeRequest):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"summary": "Please upload a PDF first!"}
+    cleanup_expired_sessions()
 
+    session_data = sessions.get(data.session_id)
+    if not session_data:
+        return {"summary": "Session expired or no PDF uploaded for this session!"}
+
+    session_data["last_accessed"] = time.time()
+    vectorstore = session_data["vectorstore"]  # Retrieve session-specific store
+
+    # Retrieve chunks from the SESSION vectorstore
     docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
     if not docs:
         return {"summary": "No document context available to summarize."}
 
-    # Context is already clean (normalized at ingestion)
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = (
-        "You are a document summarization assistant working with a certificate or official document.\n"
-        "RULES:\n"
+    system_prompt = (
+        "You are a document summarization assistant.\n"
+        "Rules:\n"
         "1. Summarize in 6-8 concise bullet points.\n"
-        "2. Clearly distinguish: who received the certificate, what course, which company issued it,\n"
-        "   who signed it, on what platform, and on what date.\n"
-        "3. Return clean, properly formatted text — no character spacing, proper Title Case for names.\n"
-        "4. Use ONLY the information in the context below.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary (bullet points):"
+        "2. Clearly state: who received the certificate/document, what it is for, "
+        "which organization issued it, who authorized it, and the date.\n"
+        "3. Use proper Title Case for names. Return clean, readable text.\n"
+        "4. Use ONLY the information in the provided context."
     )
 
-    raw_summary = generate_response(prompt, max_new_tokens=512)
+    user_prompt = f"Context:\n{context}\n\nSummary (bullet points):"
+
+    raw_summary = generate_response(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=512
+    )
     summary = normalize_answer(raw_summary)
     return {"summary": summary}
 
