@@ -4,6 +4,8 @@ const multer = require("multer");
 const axios = require("axios");
 const axiosRetry = require("axios-retry").default;
 const path = require("path");
+const rateLimit = require("express-rate-limit");
+const session = require("express-session");
 require("dotenv").config();
 
 // ------------------------------------------------------------------
@@ -13,6 +15,7 @@ const API_REQUEST_TIMEOUT = parseInt(
   process.env.API_REQUEST_TIMEOUT || "45000",
   10
 );
+
 const MAX_RETRY_ATTEMPTS = parseInt(
   process.env.MAX_RETRY_ATTEMPTS || "3",
   10
@@ -27,18 +30,30 @@ app.use(cors());
 app.use(express.json());
 
 // ------------------------------------------------------------------
-// AXIOS RETRY CONFIG
+// SESSION (per-user chat history)
+// ------------------------------------------------------------------
+app.use(
+  session({
+    secret: "pdf-qa-bot-secret-key",
+    resave: false,
+    saveUninitialized: true,
+    cookie: {
+      secure: false,
+      maxAge: 1000 * 60 * 60 * 24, // 24 hours
+    },
+  })
+);
+
+// ------------------------------------------------------------------
+// AXIOS RETRY CONFIG (PR FEATURE)
 // ------------------------------------------------------------------
 axiosRetry(axios, {
   retries: MAX_RETRY_ATTEMPTS,
   retryDelay: axiosRetry.exponentialDelay,
-  retryCondition: (error) => {
-    return (
-      axiosRetry.isNetworkOrIdempotentRequestError(error) ||
-      error.code === "ECONNABORTED" ||
-      (error.response && error.response.status >= 500)
-    );
-  },
+  retryCondition: (error) =>
+    axiosRetry.isNetworkOrIdempotentRequestError(error) ||
+    error.code === "ECONNABORTED" ||
+    (error.response && error.response.status >= 500),
   onRetry: (retryCount, error, requestConfig) => {
     console.warn(
       `Retry ${retryCount} for ${requestConfig.url} - ${error.message}`
@@ -47,137 +62,192 @@ axiosRetry(axios, {
 });
 
 // ------------------------------------------------------------------
-// MULTER CONFIG (PDF UPLOADS)
+// RATE LIMITERS (MASTER FEATURE)
+// ------------------------------------------------------------------
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "Too many PDF uploads, try again later",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const askLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: "Too many questions, try again later",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const summarizeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "Too many summarize requests, try again later",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const compareLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "Too many compare requests, try again later",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// ------------------------------------------------------------------
+// MULTER CONFIG
 // ------------------------------------------------------------------
 const upload = multer({ dest: "uploads/" });
 
 // ------------------------------------------------------------------
 // ROUTE: UPLOAD PDF
 // ------------------------------------------------------------------
-app.post("/upload", upload.single("file"), async (req, res) => {
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
-      return res
-        .status(400)
-        .json({ error: "No file uploaded. Use form field name 'file'." });
+      return res.status(400).json({
+        error: "No file uploaded. Use form field name 'file'.",
+      });
+    }
+
+    const sessionId = req.body.sessionId;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Missing sessionId." });
     }
 
     const filePath = path.join(__dirname, req.file.path);
 
-    await axios.post(
+    const response = await axios.post(
       "http://localhost:5000/process-pdf",
-      { filePath },
+      { filePath, session_id: sessionId },
       { timeout: API_REQUEST_TIMEOUT }
     );
 
-    res.json({ message: "PDF uploaded & processed successfully!" });
+    res.json({ message: "PDF uploaded & processed successfully" });
   } catch (err) {
-    const details = err.response?.data || err.message;
-    console.error("Upload processing failed:", details);
+    console.error("Upload failed:", err.response?.data || err.message);
 
-    if (err.code === "ECONNABORTED" || err.response?.status === 504) {
+    if (err.code === "ECONNABORTED") {
       return res.status(504).json({
-        error: "Request timed out",
-        details:
-          "PDF processing took too long. Try a smaller PDF or try again.",
+        error: "PDF processing timed out",
       });
     }
 
-    res.status(500).json({
-      error: "PDF processing failed",
-      details,
-    });
+    res.status(500).json({ error: "Upload failed" });
   }
 });
 
 // ------------------------------------------------------------------
-// ROUTE: ASK QUESTION (WITH VALIDATION)
+// ROUTE: ASK QUESTION
 // ------------------------------------------------------------------
-app.post("/ask", async (req, res) => {
-  const { question } = req.body;
+app.post("/ask", askLimiter, async (req, res) => {
+  const { question, sessionId } = req.body;
 
-  // ---- Input Validation ----
-  if (!question || typeof question !== "string") {
-    return res
-      .status(400)
-      .json({ error: "Question is required and must be a string" });
+  // ---- Input validation (PR FEATURE) ----
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing sessionId." });
   }
 
-  if (!question.trim()) {
-    return res.status(400).json({ error: "Question cannot be empty" });
+  if (!question || typeof question !== "string" || !question.trim()) {
+    return res.status(400).json({ error: "Invalid question" });
   }
 
   if (question.length > 2000) {
-    return res
-      .status(400)
-      .json({ error: "Question too long (max 2000 characters)" });
+    return res.status(400).json({ error: "Question too long" });
   }
 
   try {
-    const startTime = Date.now();
+    if (!req.session.chatHistory) {
+      req.session.chatHistory = [];
+    }
+
+    req.session.chatHistory.push({
+      role: "user",
+      content: question.trim(),
+    });
 
     const response = await axios.post(
       "http://localhost:5000/ask",
-      { question: question.trim() },
+      {
+        question: question.trim(),
+        session_id: sessionId,
+        history: req.session.chatHistory,
+      },
       { timeout: API_REQUEST_TIMEOUT }
     );
 
-    console.log(
-      `Question answered in ${Date.now() - startTime}ms`
-    );
+    req.session.chatHistory.push({
+      role: "assistant",
+      content: response.data.answer,
+    });
 
     res.json({ answer: response.data.answer });
   } catch (err) {
-    console.error("Ask failed:", err.message);
+    console.error("Ask failed:", err.response?.data || err.message);
 
-    if (err.code === "ECONNABORTED" || err.response?.status === 504) {
-      return res.status(504).json({
-        error: "Request timed out",
-        details:
-          "The question took too long to process. Try a simpler question.",
-      });
+    if (err.code === "ECONNABORTED") {
+      return res.status(504).json({ error: "Question timed out" });
     }
 
-    res.status(err.response?.status || 500).json({
-      error: "Error answering question",
-      details: err.response?.data || err.message,
-    });
+    res.status(500).json({ error: "Error answering question" });
   }
 });
 
 // ------------------------------------------------------------------
-// ROUTE: SUMMARIZE PDF
+// ROUTE: CLEAR HISTORY
 // ------------------------------------------------------------------
-app.post("/summarize", async (req, res) => {
-  try {
-    const startTime = Date.now();
+app.post("/clear-history", (req, res) => {
+  if (req.session) {
+    req.session.chatHistory = [];
+  }
+  res.json({ message: "History cleared" });
+});
 
+// ------------------------------------------------------------------
+// ROUTE: SUMMARIZE
+// ------------------------------------------------------------------
+app.post("/summarize", summarizeLimiter, async (req, res) => {
+  const { sessionId } = req.body || {};
+
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing sessionId." });
+  }
+
+  try {
     const response = await axios.post(
       "http://localhost:5000/summarize",
-      req.body || {},
+      { session_id: sessionId },
       { timeout: API_REQUEST_TIMEOUT }
-    );
-
-    console.log(
-      `Summarization completed in ${Date.now() - startTime}ms`
     );
 
     res.json({ summary: response.data.summary });
   } catch (err) {
-    const details = err.response?.data || err.message;
-    console.error("Summarization failed:", details);
+    console.error("Summarize failed:", err.response?.data || err.message);
 
-    if (err.code === "ECONNABORTED" || err.response?.status === 504) {
-      return res.status(504).json({
-        error: "Request timed out",
-        details: "Summarization took too long. Please try again.",
-      });
+    if (err.code === "ECONNABORTED") {
+      return res.status(504).json({ error: "Summarization timed out" });
     }
 
-    res.status(err.response?.status || 500).json({
-      error: "Error summarizing PDF",
-      details,
-    });
+    res.status(500).json({ error: "Error summarizing PDF" });
+  }
+});
+
+// ------------------------------------------------------------------
+// ROUTE: COMPARE
+// ------------------------------------------------------------------
+app.post("/compare", compareLimiter, async (req, res) => {
+  try {
+    const response = await axios.post(
+      "http://localhost:5000/compare",
+      req.body,
+      { timeout: API_REQUEST_TIMEOUT }
+    );
+    res.json({ comparison: response.data.comparison });
+  } catch (err) {
+    console.error("Compare failed:", err.response?.data || err.message);
+    res.status(500).json({ error: "Error comparing documents" });
   }
 });
 

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -10,6 +10,7 @@ import os
 import re
 import uvicorn
 import torch
+import time
 import threading
 import logging
 from transformers import (
@@ -18,25 +19,33 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoModelForCausalLM,
 )
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 # -------------------------------------------------------------------
 # APP SETUP
 # -------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 load_dotenv()
 app = FastAPI()
 
-LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
+LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
+
+SESSION_TIMEOUT = 3600  # 1 hour
+sessions = {}  # { session_id: { vectorstore, last_accessed } }
 
 # -------------------------------------------------------------------
-# GLOBAL STATE (SINGLE PDF FLOW)
+# MODELS
 # -------------------------------------------------------------------
-vectorstore = None
-qa_ready = False
-
 generation_tokenizer = None
 generation_model = None
 generation_is_encoder_decoder = False
@@ -77,7 +86,7 @@ def load_generation_model():
         return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
     config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+    generation_is_encoder_decoder = bool(config.is_encoder_decoder)
 
     generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
@@ -93,7 +102,7 @@ def load_generation_model():
     return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
 # -------------------------------------------------------------------
-# TIMEOUT GENERATION
+# SAFE GENERATION WITH TIMEOUT
 # -------------------------------------------------------------------
 class TimeoutException(Exception):
     pass
@@ -150,27 +159,28 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
             LLM_GENERATION_TIMEOUT,
         )
     except TimeoutException:
-        raise HTTPException(
-            status_code=504,
-            detail="Model took too long to respond.",
-        )
+        raise HTTPException(status_code=504, detail="Model timed out")
 
     if is_encoder_decoder:
         return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
 
     input_len = encoded["input_ids"].shape[1]
-    new_tokens = output_ids[0][input_len:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    return tokenizer.decode(
+        output_ids[0][input_len:], skip_special_tokens=True
+    ).strip()
 
 # -------------------------------------------------------------------
 # REQUEST MODELS
 # -------------------------------------------------------------------
 class PDFPath(BaseModel):
     filePath: str
+    session_id: str
 
 
-class Question(BaseModel):
+class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
+    session_id: str
+    history: list = []
 
     @validator("question")
     def validate_question(cls, v):
@@ -180,17 +190,30 @@ class Question(BaseModel):
 
 
 class SummarizeRequest(BaseModel):
-    pdf: str | None = None
+    session_id: str
+
+# -------------------------------------------------------------------
+# SESSION CLEANUP
+# -------------------------------------------------------------------
+def cleanup_expired_sessions():
+    now = time.time()
+    expired = [
+        sid for sid, s in sessions.items()
+        if now - s["last_accessed"] > SESSION_TIMEOUT
+    ]
+    for sid in expired:
+        del sessions[sid]
 
 # -------------------------------------------------------------------
 # ENDPOINTS
 # -------------------------------------------------------------------
 @app.post("/process-pdf")
-def process_pdf(data: PDFPath):
-    global vectorstore, qa_ready
+@limiter.limit("15/15 minutes")
+def process_pdf(request: Request, data: PDFPath):
+    cleanup_expired_sessions()
 
     if not os.path.exists(data.filePath):
-        return {"error": "File not found."}
+        raise HTTPException(status_code=404, detail="PDF not found")
 
     loader = PyPDFLoader(data.filePath)
     raw_docs = loader.load()
@@ -203,27 +226,31 @@ def process_pdf(data: PDFPath):
         for doc in raw_docs
     ]
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100,
-    )
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(cleaned_docs)
 
     if not chunks:
-        return {"error": "No text extracted from PDF."}
+        raise HTTPException(status_code=400, detail="No text extracted from PDF")
 
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
-    qa_ready = True
+    sessions[data.session_id] = {
+        "vectorstore": FAISS.from_documents(chunks, embedding_model),
+        "last_accessed": time.time(),
+    }
 
     return {"message": "PDF processed successfully"}
 
 
 @app.post("/ask")
-def ask_question(data: Question):
-    global vectorstore, qa_ready
+@limiter.limit("60/15 minutes")
+def ask_question(request: Request, data: AskRequest):
+    cleanup_expired_sessions()
 
-    if not qa_ready or vectorstore is None:
-        return {"answer": "Please upload a PDF first!"}
+    session = sessions.get(data.session_id)
+    if not session:
+        return {"answer": "Session expired or PDF not uploaded"}
+
+    session["last_accessed"] = time.time()
+    vectorstore = session["vectorstore"]
 
     docs = vectorstore.similarity_search(data.question, k=4)
     if not docs:
@@ -232,42 +259,40 @@ def ask_question(data: Question):
     context = "\n\n".join(doc.page_content for doc in docs)
 
     prompt = (
-        "You are a helpful assistant answering questions using ONLY the context below.\n"
-        "If the answer is not present, say so briefly.\n\n"
+        "You are a helpful assistant answering ONLY from the context below.\n\n"
         f"Context:\n{context}\n\n"
-        f"Question: {data.question}\n"
-        "Answer:"
+        f"Question: {data.question}\nAnswer:"
     )
 
-    raw_answer = generate_response(prompt, max_new_tokens=256)
-    return {"answer": normalize_answer(raw_answer)}
+    answer = generate_response(prompt, max_new_tokens=256)
+    return {"answer": normalize_answer(answer)}
 
 
 @app.post("/summarize")
-def summarize_pdf(_: SummarizeRequest):
-    global vectorstore, qa_ready
+@limiter.limit("15/15 minutes")
+def summarize_pdf(request: Request, data: SummarizeRequest):
+    cleanup_expired_sessions()
 
-    if not qa_ready or vectorstore is None:
-        return {"summary": "Please upload a PDF first!"}
+    session = sessions.get(data.session_id)
+    if not session:
+        return {"summary": "Session expired or PDF not uploaded"}
 
-    docs = vectorstore.similarity_search(
-        "Give a concise summary of the document.",
-        k=6,
-    )
+    session["last_accessed"] = time.time()
+    vectorstore = session["vectorstore"]
+
+    docs = vectorstore.similarity_search("Summarize the document.", k=6)
     if not docs:
-        return {"summary": "No content available."}
+        return {"summary": "No content available"}
 
     context = "\n\n".join(doc.page_content for doc in docs)
 
     prompt = (
         "Summarize the document in 6-8 concise bullet points.\n"
-        "Use ONLY the context below.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary:"
+        f"Context:\n{context}\nSummary:"
     )
 
-    raw_summary = generate_response(prompt, max_new_tokens=220)
-    return {"summary": normalize_answer(raw_summary)}
+    summary = generate_response(prompt, max_new_tokens=220)
+    return {"summary": normalize_answer(summary)}
 
 # -------------------------------------------------------------------
 # START SERVER
