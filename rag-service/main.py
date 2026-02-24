@@ -5,6 +5,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from groq import Groq
 from dotenv import load_dotenv
 from transformers import (
     AutoConfig,
@@ -26,6 +28,10 @@ import docx
 # APP SETUP
 # ===============================
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
+
 app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -58,6 +64,9 @@ def normalize_spaced_text(text: str) -> str:
 
 
 def normalize_answer(text: str) -> str:
+    """
+    Post-processes the LLM-generated answer.
+    """
     text = normalize_spaced_text(text)
     text = re.sub(r"^(Answer[^:]*:|Context:|Question:)\s*", "", text, flags=re.I)
     return text.strip()
@@ -164,6 +173,8 @@ class AskRequest(BaseModel):
 
 class SummarizeRequest(BaseModel):
     session_id: str
+    pdf: str | None = None
+
 
 
 # ===============================
@@ -236,8 +247,10 @@ def ask(request: Request, data: AskRequest):
     Question:
     {data.question}
 
-    Answer:
-    """
+    user_prompt = CCC_PROMPT.format(
+        context=context,
+        question=question_with_history,
+    )
 
     answer = generate_response(prompt, 150)
 

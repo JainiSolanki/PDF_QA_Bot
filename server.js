@@ -6,6 +6,11 @@ const axiosRetry = require("axios-retry").default;
 const path = require("path");
 const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
+const { fileTypeFromFile } = require("file-type");
+const fs = require("fs");
+
+const app = express(); // Trust first proxy for rate limiting if behind a proxy
 const session = require("express-session");
 require("dotenv").config();
 
@@ -25,7 +30,6 @@ const MAX_RETRY_ATTEMPTS = parseInt(
 // ------------------------------------------------------------------
 // APP SETUP
 // ------------------------------------------------------------------
-const app = express();
 app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
@@ -80,6 +84,13 @@ const compareLimiter = rateLimit({
   max: 10,
 });
 
+// Storage for uploaded PDFs
+const UPLOAD_DIR = path.resolve(__dirname, "uploads");
+
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR);
+}
+
 // ------------------------------------------------------------------
 // MULTER CONFIG
 // ------------------------------------------------------------------
@@ -98,7 +109,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
+  limits: { fileSize: 20 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     if (SUPPORTED_EXTENSIONS.includes(ext)) {
@@ -135,14 +146,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       sessionId,
     });
   } catch (err) {
-    console.error("Upload failed:", err.response?.data || err.message);
-
-    if (err.code === "ECONNABORTED") {
-      return res.status(504).json({
-        error: "PDF processing timed out",
-      });
-    }
-
+    console.error("Upload failed:", err.message);
     res.status(500).json({ error: "Upload failed" });
   }
 });
@@ -186,15 +190,10 @@ app.post("/ask", askLimiter, async (req, res) => {
       content: response.data.answer,
     });
 
-    res.json({ answer: response.data.answer });
-  } catch (err) {
-    console.error("Ask failed:", err.response?.data || err.message);
-
-    if (err.code === "ECONNABORTED") {
-      return res.status(504).json({ error: "Question timed out" });
-    }
-
-    res.status(500).json({ error: "Error answering question" });
+    res.json(response.data);
+  } catch (error) {
+    console.error("Ask failed:", error.message);
+    res.status(500).json({ error: "Error asking question" });
   }
 });
 
@@ -241,6 +240,11 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
 // ROUTE: COMPARE
 // ------------------------------------------------------------------
 app.post("/compare", compareLimiter, async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing sessionId." });
+  }
+
   try {
     const response = await axios.post(
       "http://localhost:5000/compare",
@@ -255,9 +259,4 @@ app.post("/compare", compareLimiter, async (req, res) => {
   }
 });
 
-// ------------------------------------------------------------------
-// START SERVER
-// ------------------------------------------------------------------
-app.listen(4000, () => {
-  console.log("Backend running on http://localhost:4000");
-});
+app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
