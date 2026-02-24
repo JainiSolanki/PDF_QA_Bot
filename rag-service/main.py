@@ -51,6 +51,44 @@ embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
+SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"]
+
+# -------------------------------------------------------------------
+# DOCUMENT LOADERS
+# -------------------------------------------------------------------
+def load_pdf(file_path: str) -> list[Document]:
+    loader = PyPDFLoader(file_path)
+    return loader.load()
+
+def load_docx(file_path: str) -> list[Document]:
+    import docx
+    doc = docx.Document(file_path)
+    texts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                texts.extend([p.text.strip() for p in cell.paragraphs if p.text.strip()])
+    full_text = "\n".join(texts)
+    return [Document(page_content=full_text, metadata={"source": file_path})]
+
+def load_txt(file_path: str) -> list[Document]:
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return [Document(page_content=content, metadata={"source": file_path})]
+
+def load_document(file_path: str) -> list[Document]:
+    ext = Path(file_path).suffix.lower()
+    if ext == ".pdf":
+        return load_pdf(file_path)
+    elif ext == ".docx":
+        return load_docx(file_path)
+    elif ext in (".txt", ".md"):
+        return load_txt(file_path)
+    else:
+        raise ValueError(f"Unsupported format: {ext}")
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+
 # -------------------------------------------------------------------
 # TEXT NORMALIZATION
 # -------------------------------------------------------------------
@@ -214,10 +252,16 @@ def process_pdf(request: Request, data: DocumentPath):
             detail="No text extracted from the document."
         )
 
-    sessions[data.session_id] = {
-        "vectorstore": FAISS.from_documents(chunks, embedding_model),
-        "last_accessed": time.time(),
-    }
+    if data.session_id in sessions:
+        # Append to existing vectorstore
+        sessions[data.session_id]["vectorstore"].add_documents(chunks)
+        sessions[data.session_id]["last_accessed"] = time.time()
+    else:
+        # Create new vectorstore
+        sessions[data.session_id] = {
+            "vectorstore": FAISS.from_documents(chunks, embedding_model),
+            "last_accessed": time.time(),
+        }
 
     return {"message": "Document processed successfully"}
 
