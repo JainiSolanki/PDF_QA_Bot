@@ -2,16 +2,42 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
+const axiosRetry = require("axios-retry").default;
+const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const rateLimit = require("express-rate-limit");
+const { fileTypeFromFile } = require("file-type");
+
+const app = express(); // Trust first proxy for rate limiting if behind a proxy
 const session = require("express-session");
+require("dotenv").config();
 
 const app = express();
+
+// ------------------------------------------------------------------
+// CONFIGURATION
+// ------------------------------------------------------------------
+const API_REQUEST_TIMEOUT = parseInt(
+  process.env.API_REQUEST_TIMEOUT || "45000",
+  10
+);
+
+const MAX_RETRY_ATTEMPTS = parseInt(
+  process.env.MAX_RETRY_ATTEMPTS || "3",
+  10
+);
+
+// ------------------------------------------------------------------
+// APP SETUP
+// ------------------------------------------------------------------
 app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-// Session middleware for per-user chat history
+// ------------------------------------------------------------------
+// SESSION (per-user chat history)
+// ------------------------------------------------------------------
 app.use(
   session({
     secret: "pdf-qa-bot-secret-key",
@@ -19,9 +45,9 @@ app.use(
     saveUninitialized: true,
     cookie: {
       secure: false,
-      maxAge: 1000 * 60 * 60 * 24, // 24 hours
+      maxAge: 1000 * 60 * 60 * 24,
     },
-  }),
+  })
 );
 
 // ---------------------------------------------------------------------------
@@ -42,8 +68,10 @@ const askLimiter = makeLimiter(30, "Too many questions, please try again after 1
 const summarizeLimiter = makeLimiter(10, "Too many summarization requests, please try again after 15 minutes.");
 const compareLimiter = makeLimiter(10, "Too many comparison requests, please try again after 15 minutes.");
 
-// Storage for uploaded PDFs
-const upload = multer({ dest: "uploads/" });
+// ------------------------------------------------------------------
+// FILE STORAGE
+// ------------------------------------------------------------------
+const UPLOAD_DIR = path.resolve(__dirname, "uploads");
 
 // RAG service base URL (Python FastAPI)
 const RAG_URL = "http://localhost:5000";
@@ -60,7 +88,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
     }
 
-    const sessionId = req.body.sessionId;
+    const { sessionId } = req.body;
     if (!sessionId) {
       return res.status(400).json({ error: "Missing sessionId." });
     }
@@ -170,6 +198,7 @@ app.post("/compare", compareLimiter, async (req, res) => {
     console.error("[/compare]", err.response?.data || err.message);
     return res.status(500).json({ error: "Error comparing documents. Please try again." });
   }
+  next(err);
 });
 
 // ---------------------------------------------------------------------------

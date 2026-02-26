@@ -1,21 +1,29 @@
-from fastapi import FastAPI
-from fastapi import Request
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from groq import Groq
 from dotenv import load_dotenv
-import os
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+import os 
 import re
 import uuid
 import uvicorn
-import torch
-import time
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+import threading
+from datetime import datetime
 
 # Post-processing helpers: strip prompt echoes / context leakage from LLM output
 # so that the API always returns only the clean, user-facing answer/summary/comparison.
@@ -25,6 +33,9 @@ from utils.postprocess import extract_final_answer, extract_final_summary, extra
 from utils.prompt_templates import build_ask_prompt, build_summarize_prompt, build_compare_prompt
 
 load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
 
 app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
@@ -37,10 +48,12 @@ app.state.limiter = limiter
 sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
 
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
+# ---------------------------------------------------------------------------
+# GLOBAL STATE MANAGEMENT (Thread-safe, Multi-user support)
+# ---------------------------------------------------------------------------
+# Per-user/session storage with proper cleanup and locking
+sessions = {}  # {session_id: {"vectorstore": FAISS, "upload_time": datetime}}
+sessions_lock = threading.RLock()  # Thread-safe access to sessions
 
 # Load local embedding model once at startup
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -75,16 +88,22 @@ print("[STARTUP] ✅ Model loaded successfully!")
 
 
 # ---------------------------------------------------------------------------
-# TEXT NORMALIZATION UTILITIES
+# SESSION MANAGEMENT UTILITIES (Thread-safe, Multi-user support)
 # ---------------------------------------------------------------------------
 
-def normalize_spaced_text(text: str) -> str:
+def get_session_vectorstore(session_id: str):
     """
     Fixes character-level spaced text produced by PyPDFLoader on certain
     vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
     """
-    def fix_spaced_word(match):
-        return match.group(0).replace(" ", "")
+    Safely clears a specific session's vectorstore and data.
+    """
+    with sessions_lock:
+        if session_id in sessions:
+            old_vectorstore = sessions[session_id].get("vectorstore")
+            if old_vectorstore is not None:
+                del old_vectorstore  # Allow garbage collection
+            del sessions[session_id]
 
     pattern = r'\b(?:[A-Za-z] ){2,}[A-Za-z]\b'
     return re.sub(pattern, fix_spaced_word, text)
@@ -105,43 +124,39 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
     model_device = next(model.parameters()).device
 
     encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {key: value.to(model_device) for key, value in encoded.items()}
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    encoded = {k: v.to(device) for k, v in encoded.items()}
 
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
+    output = model.generate(
+        **encoded,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
 
-    if is_encoder_decoder:
-        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        return text.strip()
+    if is_enc:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
 
-    input_len = encoded["input_ids"].shape[1]
-    new_tokens = generated_ids[0][input_len:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return text.strip()
+    return tokenizer.decode(
+        output[0][encoded["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
 
 
-# ---------------------------------------------------------------------------
+# ===============================
 # REQUEST MODELS
-# ---------------------------------------------------------------------------
-
-class PDFPath(BaseModel):
+# ===============================
+class DocumentPath(BaseModel):
     filePath: str
     session_id: str
 
+
 class AskRequest(BaseModel):
-    question: str
+    question: str = Field(..., min_length=1)
     session_id: str
     doc_ids: list = []       # optional list of doc IDs to restrict search
     history: list = []
 
 class SummarizeRequest(BaseModel):
-    pdf: str | None = None
     session_id: str
     doc_ids: list = []
 
@@ -194,17 +209,13 @@ def merged_similarity_search(vectorstores: list[FAISS], query: str, k: int = 4) 
     return results[:k * len(vectorstores)]  # return more chunks for multi-doc
 
 
-# ---------------------------------------------------------------------------
-# ENDPOINTS
-# ---------------------------------------------------------------------------
 
-@app.post("/process-pdf")
-@limiter.limit("15/15 minutes")
-def process_pdf(request: Request, data: PDFPath):
-    cleanup_expired_sessions()
+class CompareRequest(BaseModel):
+    session_id: str
 
-    loader = PyPDFLoader(data.filePath)
-    raw_docs = loader.load()
+# -------------------------------------------------------------------
+# SESSION CLEANUP
+# -------------------------------------------------------------------
 
     # Normalize at ingestion
     cleaned_docs = [
@@ -215,10 +226,12 @@ def process_pdf(request: Request, data: PDFPath):
         for doc in raw_docs
     ]
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_documents(cleaned_docs)
-    if not chunks:
-        return {"error": "No text chunks generated from the PDF. Please check your file."}
+def cleanup_expired_sessions():
+    now = time.time()
+    expired = [k for k, v in sessions.items()
+               if now - v["last"] > SESSION_TIMEOUT]
+    for k in expired:
+        del sessions[k]
 
     vectorstore = FAISS.from_documents(chunks, embedding_model)
 

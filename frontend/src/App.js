@@ -1,8 +1,6 @@
-
 import React, { useState, useEffect } from "react";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
-import { Document, Page, pdfjs } from "react-pdf";
 import "bootstrap/dist/css/bootstrap.min.css";
 import {
   Container,
@@ -23,12 +21,13 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
 const API_BASE = process.env.REACT_APP_API_URL || "";
 
 // Theme persistence key
-const THEME_STORAGE_KEY = "pdf-qa-bot-theme";
+const THEME_STORAGE_KEY = 'pdf-qa-bot-theme';
 
 function App() {
   const [file, setFile] = useState(null);
-  const [pdfs, setPdfs] = useState([]); // {name, doc_id, url}
-  const [selectedDocs, setSelectedDocs] = useState([]);
+  const [pdfs, setPdfs] = useState([]); // {name, url, chat: [], processed: false, session_id}
+  const [selectedPdf, setSelectedPdf] = useState(null);
+  const [selectedSessions, setSelectedSessions] = useState([]); // ← renamed from selectedDocs, stores session_ids
   const [chatHistory, setChatHistory] = useState([]);
   const [comparisonResult, setComparisonResult] = useState(null);
   const [question, setQuestion] = useState("");
@@ -43,39 +42,106 @@ function App() {
   const [pageNumber, setPageNumber] = useState(1);
   const [summarizing, setSummarizing] = useState(false);
   const [comparing, setComparing] = useState(false);
-  const [sessionId, setSessionId] = useState("");
-
-  // Generate a session ID on mount (fix-data-leakage)
-  useEffect(() => {
-    setSessionId(
-      crypto.randomUUID
-        ? crypto.randomUUID()
-        : Math.random().toString(36).substring(2, 15),
-    );
-  }, []);
 
   // Save theme preference when it changes
   useEffect(() => {
     localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(darkMode));
-    document.body.classList.toggle("dark-mode", darkMode);
+    document.body.classList.toggle('dark-mode', darkMode);
   }, [darkMode]);
 
   // ===============================
-  // Upload
+  // localStorage Helper
   // ===============================
+  const isLocalStorageAvailable = () => {
+    try {
+      const test = "__localStorage_test__";
+      localStorage.setItem(test, test);
+      localStorage.removeItem(test);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    if (!isLocalStorageAvailable()) return;
+
+    const savedChatHistory = localStorage.getItem("chatHistory");
+    const savedPdfs = localStorage.getItem("pdfs");
+
+    if (savedChatHistory) {
+      try {
+        setChatHistory(JSON.parse(savedChatHistory));
+      } catch (err) {
+        console.error("Error loading chat history:", err);
+      }
+    }
+
+    if (savedPdfs) {
+      try {
+        setPdfs(JSON.parse(savedPdfs));
+      } catch (err) {
+        console.error("Error loading PDFs:", err);
+      }
+    }
+  }, []);
+
+  // Save chatHistory to localStorage whenever it changes
+  useEffect(() => {
+    if (!isLocalStorageAvailable()) return;
+    try {
+      localStorage.setItem("chatHistory", JSON.stringify(chatHistory));
+    } catch (err) {
+      console.error("Error saving chat history:", err);
+    }
+  }, [chatHistory]);
+
+  // Save pdfs to localStorage whenever it changes
+  useEffect(() => {
+    if (!isLocalStorageAvailable()) return;
+    try {
+      localStorage.setItem("pdfs", JSON.stringify(pdfs));
+    } catch (err) {
+      console.error("Error saving PDFs:", err);
+    }
+  }, [pdfs]);
+
+  // Clear history function
+  const clearHistory = () => {
+    if (window.confirm("Are you sure you want to clear all chat history and uploads?")) {
+      setChatHistory([]);
+      setPdfs([]);
+      setSelectedSessions([]); // ← updated
+      if (isLocalStorageAvailable()) {
+        try {
+          localStorage.removeItem("chatHistory");
+          localStorage.removeItem("pdfs");
+        } catch (err) {
+          console.error("Error clearing localStorage:", err);
+        }
+      }
+    }
+  };
+
+  // Multi-PDF upload
   const uploadPDF = async () => {
     if (!file) return;
     setUploading(true);
     setProcessingPdf(true);
     const formData = new FormData();
     formData.append("file", file);
-    formData.append("sessionId", sessionId);
     try {
       const res = await axios.post(`${API_BASE}/upload`, formData);
       const url = URL.createObjectURL(file);
       setPdfs((prev) => [
         ...prev,
-        { name: file.name, doc_id: res.data.doc_id, url },
+        {
+          name: file.name,
+          doc_id: res.data.doc_id,
+          session_id: res.data.session_id, // ← keep session_id on the entry
+          url,
+        },
       ]);
       setFile(null);
       alert("PDF uploaded!");
@@ -83,34 +149,32 @@ function App() {
       alert("Upload failed.");
     }
     setUploading(false);
-    setProcessingPdf(false);
   };
 
   // ===============================
-  // Toggle selection
+  // Toggle selection — keyed by session_id
   // ===============================
-  const toggleDocSelection = (doc_id) => {
+  const toggleDocSelection = (session_id) => {
     setComparisonResult(null);
-    setSelectedDocs((prev) =>
-      prev.includes(doc_id)
-        ? prev.filter((id) => id !== doc_id)
-        : [...prev, doc_id],
+    setSelectedSessions((prev) =>
+      prev.includes(session_id)
+        ? prev.filter((id) => id !== session_id)
+        : [...prev, session_id],
     );
   };
 
   // ===============================
-  // Ask
+  // Ask — sends session_ids
   // ===============================
   const askQuestion = async () => {
-    if (!question.trim() || selectedDocs.length === 0) return;
+    if (!question.trim() || selectedSessions.length === 0) return;
     setChatHistory((prev) => [...prev, { role: "user", text: question }]);
     setQuestion("");
     setAsking(true);
     try {
       const res = await axios.post(`${API_BASE}/ask`, {
         question,
-        doc_ids: selectedDocs,
-        sessionId,
+        session_ids: selectedSessions, // ← changed from doc_ids to session_ids
       });
       setChatHistory((prev) => [
         ...prev,
@@ -125,16 +189,13 @@ function App() {
     setAsking(false);
   };
 
-  // ===============================
-  // Summarize
-  // ===============================
+  // Summarization — sends session_ids
   const summarizePDF = async () => {
-    if (selectedDocs.length === 0) return;
+    if (selectedSessions.length === 0) return;
     setSummarizing(true);
     try {
       const res = await axios.post(`${API_BASE}/summarize`, {
-        doc_ids: selectedDocs,
-        sessionId,
+        session_ids: selectedSessions, // ← changed from doc_ids to session_ids
       });
       setChatHistory((prev) => [
         ...prev,
@@ -147,17 +208,16 @@ function App() {
   };
 
   // ===============================
-  // Compare
+  // Compare — sends session_ids
   // ===============================
   const compareDocuments = async () => {
-    if (selectedDocs.length < 2) return;
+    if (selectedSessions.length < 2) return;
     setComparing(true);
     try {
       const res = await axios.post(`${API_BASE}/compare`, {
-        doc_ids: selectedDocs,
-        sessionId,
+        session_ids: selectedSessions, // ← changed from doc_ids to session_ids
       });
-      if (selectedDocs.length === 2) {
+      if (selectedSessions.length === 2) {
         setComparisonResult(res.data.comparison);
       } else {
         setChatHistory((prev) => [
@@ -172,7 +232,8 @@ function App() {
     setComparing(false);
   };
 
-  const selectedPdfs = pdfs.filter((p) => selectedDocs.includes(p.doc_id));
+  // selectedPdfs — filtered by session_id
+  const selectedPdfs = pdfs.filter((p) => selectedSessions.includes(p.session_id)); // ← updated
 
   // ===============================
   // Theme classes
@@ -210,6 +271,9 @@ function App() {
             PDF Q&A Bot
           </Navbar.Brand>
           <div className="d-flex align-items-center gap-2">
+            <Button variant="danger" size="sm" onClick={clearHistory}>
+              Clear History
+            </Button>
             <span className="text-white small">
               {darkMode ? "⭐ Dark" : "🔆 Light"}
             </span>
@@ -220,7 +284,10 @@ function App() {
                 role="switch"
                 id="darkModeToggle"
                 checked={darkMode}
-                onChange={() => setDarkMode(!darkMode)}
+                onChange={() => {
+                  setDarkMode(!darkMode);
+                  localStorage.setItem("darkMode", !darkMode);
+                }}
                 aria-label="Toggle dark/light mode"
                 style={{ cursor: "pointer", width: "40px", height: "22px" }}
               />
@@ -261,11 +328,11 @@ function App() {
               <h5>Select Documents</h5>
               {pdfs.map((pdf) => (
                 <Form.Check
-                  key={pdf.doc_id}
+                  key={pdf.session_id}                                      // ← keyed by session_id
                   type="checkbox"
                   label={pdf.name}
-                  checked={selectedDocs.includes(pdf.doc_id)}
-                  onChange={() => toggleDocSelection(pdf.doc_id)}
+                  checked={selectedSessions.includes(pdf.session_id)}      // ← checked by session_id
+                  onChange={() => toggleDocSelection(pdf.session_id)}      // ← toggled by session_id
                 />
               ))}
             </Card.Body>
@@ -277,7 +344,7 @@ function App() {
           <>
             <Row className="mb-4">
               {selectedPdfs.map((pdf) => (
-                <Col key={pdf.doc_id} md={6}>
+                <Col key={pdf.session_id} md={6}>
                   <Card className={cardClass}>
                     <Card.Body>
                       <h6>{pdf.name}</h6>
@@ -331,22 +398,14 @@ function App() {
                 ))}
               </div>
 
-              <Form
-                className="d-flex gap-2 mb-3"
-                onSubmit={(e) => e.preventDefault()}
-              >
+              <Form className="d-flex gap-2 mb-3" onSubmit={(e) => e.preventDefault()}>
                 <Form.Control
                   type="text"
                   placeholder="Ask a question..."
                   className={inputClass}
                   value={question}
                   onChange={(e) => setQuestion(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      askQuestion();
-                    }
-                  }}
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); askQuestion(); } }}
                 />
                 <Button
                   variant="success"
@@ -357,11 +416,7 @@ function App() {
                 </Button>
               </Form>
 
-              <Button
-                variant="warning"
-                className="me-2"
-                onClick={summarizePDF}
-              >
+              <Button variant="warning" className="me-2" onClick={summarizePDF}>
                 {summarizing ? (
                   <Spinner size="sm" animation="border" />
                 ) : (
@@ -372,7 +427,7 @@ function App() {
               <Button
                 variant="info"
                 onClick={compareDocuments}
-                disabled={selectedDocs.length < 2}
+                disabled={selectedSessions.length < 2}  // ← updated
               >
                 {comparing ? (
                   <Spinner size="sm" animation="border" />
