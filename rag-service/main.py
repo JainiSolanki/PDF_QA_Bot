@@ -36,12 +36,7 @@ app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
-# ===============================
-# CONFIG
-# ===============================
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
-LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
-SESSION_TIMEOUT = 3600
+
 
 # ---------------------------------------------------------------------------
 # GLOBAL STATE MANAGEMENT (Thread-safe, Multi-user support)
@@ -104,9 +99,10 @@ def clear_session(session_id: str):
             del sessions[session_id]
 
 
+
 def normalize_spaced_text(text: str) -> str:
     pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
-    return re.sub(pattern, lambda m: m.group(0).replace(" ", ""), text)
+
 
 
 def normalize_answer(text: str) -> str:
@@ -148,45 +144,6 @@ def load_document(file_path: str):
         raise ValueError("Unsupported file format")
 
 
-# ===============================
-# MODEL LOADING
-# ===============================
-def load_generation_model():
-    global generation_model, generation_tokenizer, generation_is_encoder_decoder
-
-    if generation_model:
-        return generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(config.is_encoder_decoder)
-
-    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
-
-    if generation_is_encoder_decoder:
-        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
-    else:
-        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
-
-    if torch.cuda.is_available():
-        generation_model = generation_model.to("cuda")
-
-    generation_model.eval()
-    return generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-
-def generate_response(prompt: str, max_new_tokens: int):
-    tokenizer, model, is_enc = load_generation_model()
-    device = next(model.parameters()).device
-
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {k: v.to(device) for k, v in encoded.items()}
-
-    output = model.generate(
-        **encoded,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-    )
 
     if is_enc:
         return tokenizer.decode(output[0], skip_special_tokens=True)
@@ -280,12 +237,6 @@ def process_pdf(request: Request, data: PDFPath):
             "session_id": session_id,
             "upload_time": upload_time,
             "chunks_created": len(chunks)
-        }
-            
-    except Exception as e:
-        return {
-            "error": f"PDF processing failed: {str(e)}",
-            "details": "Please ensure the file is a valid PDF"
         }
 
 
