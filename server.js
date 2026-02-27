@@ -96,11 +96,25 @@ app.get("/readyz", async (req, res) => {
 
 // FIX: Upload endpoint with file cleanup to prevent disk space exhaustion (Issue #110)
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+  // Guard against missing file to avoid accessing properties of undefined
+  if (!req.file || !req.file.path) {
+    return res.status(400).json({ error: "No file uploaded." });
+  }
+
   const filePath = path.resolve(req.file.path);
+  const uploadDirResolved = path.resolve(UPLOAD_DIR);
+  
+  // SECURITY: Validate that the file path is within UPLOAD_DIR (prevent path traversal)
+  if (!filePath.startsWith(uploadDirResolved + path.sep) && filePath !== uploadDirResolved) {
+    console.error("[/upload] Path traversal attempt detected:", filePath);
+    return res.status(400).json({ error: "Invalid file path." });
+  }
+
+  let fileStream;
 
   try {
     // Create a readable stream from the uploaded file
-    const fileStream = fs.createReadStream(filePath);
+    fileStream = fs.createReadStream(filePath);
     
     // Use FormData to send multipart data to FastAPI
     const FormData = require("form-data");
@@ -130,17 +144,19 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     console.error("[/upload]", err.response?.data || err.message);
     return res.status(500).json({ error: "Upload failed." });
   } finally {
+    // SECURITY: Destroy stream to prevent file descriptor leaks (especially on Windows)
+    if (fileStream) {
+      fileStream.destroy();
+    }
+    
     // FIX: Delete uploaded file from Node server after processing (Issue #110)
     // This prevents disk space exhaustion from orphaned PDF files
-    if (fs.existsSync(filePath)) {
-      fs.unlink(filePath, (unlinkErr) => {
-        if (unlinkErr) {
-          console.warn(`[/upload] Failed to delete file ${filePath}:`, unlinkErr.message);
-        } else {
-          console.log(`[/upload] Successfully deleted file: ${filePath}`);
-        }
-      });
-    }
+    fs.unlink(filePath, (unlinkErr) => {
+      if (unlinkErr && unlinkErr.code !== "ENOENT") {
+        // Only log if it's not "file not found" (which is fine)
+        console.warn(`[/upload] Failed to delete file: ${unlinkErr.message}`);
+      }
+    });
   }
 });
 

@@ -156,7 +156,14 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     session_id = str(uuid4())
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+    # SECURITY: Use only uuid4().hex to prevent path traversal from client filename
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}.pdf")
+    upload_dir_resolved = os.path.abspath(upload_dir)
+    file_path_resolved = os.path.abspath(file_path)
+    
+    # SECURITY: Validate that file_path is within upload_dir (prevent path traversal)
+    if not file_path_resolved.startswith(upload_dir_resolved + os.sep):
+        return {"error": "Upload failed: Invalid file path detected."}
 
     try:
         with open(file_path, "wb") as buffer:
@@ -216,12 +223,14 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     finally:
         # FIX: Delete PDF file after processing to prevent disk space exhaustion (Issue #110)
         # This ensures the physical file is deleted even if OCR or embedding fails
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-                print(f"[/upload] Successfully deleted file: {file_path}")
-            except OSError as delete_err:
-                print(f"[/upload] Failed to delete file {file_path}: {str(delete_err)}")
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            # File already deleted or never created; nothing to clean up
+            pass
+        except OSError as delete_err:
+            # Log other errors but don't crash
+            print(f"[/upload] Warning: Failed to delete file: {str(delete_err)}")
 
 
 
