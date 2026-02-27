@@ -212,6 +212,17 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": f"Upload failed: {str(e)}"}
+    
+    finally:
+        # FIX: Delete PDF file after processing to prevent disk space exhaustion (Issue #110)
+        # This ensures the physical file is deleted even if OCR or embedding fails
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                print(f"[/upload] Successfully deleted file: {file_path}")
+            except OSError as delete_err:
+                print(f"[/upload] Failed to delete file {file_path}: {str(delete_err)}")
+
 
 
 # ===============================

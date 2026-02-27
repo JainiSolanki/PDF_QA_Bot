@@ -94,14 +94,24 @@ app.get("/readyz", async (req, res) => {
   }
 });
 
+// FIX: Upload endpoint with file cleanup to prevent disk space exhaustion (Issue #110)
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+  const filePath = path.resolve(req.file.path);
 
-    const filePath = path.resolve(req.file.path);
+  try {
+    // Create a readable stream from the uploaded file
+    const fileStream = fs.createReadStream(filePath);
+    
+    // Use FormData to send multipart data to FastAPI
+    const FormData = require("form-data");
+    const formData = new FormData();
+    formData.append("file", fileStream);
 
     const response = await axios.post(
       `${RAG_URL}/upload`,
-      formData.append("file", fileStream),
+      formData,
       {
-        headers: { "Content-Type": "multipart/form-data" },
+        headers: formData.getHeaders(),
         timeout: 180000,
       }
     );
@@ -119,6 +129,18 @@ app.get("/readyz", async (req, res) => {
   } catch (err) {
     console.error("[/upload]", err.response?.data || err.message);
     return res.status(500).json({ error: "Upload failed." });
+  } finally {
+    // FIX: Delete uploaded file from Node server after processing (Issue #110)
+    // This prevents disk space exhaustion from orphaned PDF files
+    if (fs.existsSync(filePath)) {
+      fs.unlink(filePath, (unlinkErr) => {
+        if (unlinkErr) {
+          console.warn(`[/upload] Failed to delete file ${filePath}:`, unlinkErr.message);
+        } else {
+          console.log(`[/upload] Successfully deleted file: ${filePath}`);
+        }
+      });
+    }
   }
 });
 
