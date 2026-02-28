@@ -17,16 +17,26 @@ import time
 import uuid
 import torch
 import uvicorn
+import torch
+import time
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 import pdf2image
 import pytesseract
 from PIL import Image
+# ---------------------------------------------------------------------------
+# Utils: post-processing, prompt building, numeric answer disambiguation
+# ---------------------------------------------------------------------------
 
-# Post-processing helpers: strip prompt echoes / context leakage from LLM output
-# so that the API always returns only the clean, user-facing answer/summary/comparison.
+# Post-processing: strip prompt echoes / context leakage from every LLM response.
 from utils.postprocess import extract_final_answer, extract_final_summary, extract_comparison
 
-# Centralised minimal prompt builders (short prompts → less instruction echoing).
+# Minimal prompt builders (short prompts → less instruction echoing by the model).
 from utils.prompt_templates import build_ask_prompt, build_summarize_prompt, build_compare_prompt
+
+# Query expansion + answer-type chunk re-ranking + typed-answer validation.
+from utils.query_utils import expand_query, rerank_docs, extract_typed_answer, get_answer_type_hint
 
 load_dotenv()
 
@@ -253,6 +263,28 @@ def ask_question(request: Request, data: AskRequest):
         if session:
             session["last_accessed"] = time.time()
 
+    vectorstores = get_session_docs(data.session_id, data.doc_ids)
+    if not vectorstores:
+        return {"answer": "No documents found for the selected session."}
+
+    question = data.question
+    history  = data.history
+
+    # Build conversation context (last 5 turns max)
+    conversation_context = ""
+    for msg in history[-5:]:
+        role    = msg.get("role", "")
+        content = msg.get("content", "")
+        conversation_context += f"{role}: {content}\n"
+
+    # ── Step 1: Query expansion — cast a wider net for numeric/typed answers ──
+    # e.g. "What is the percentage?" → appends "percentage % score marks grade"
+    expanded_query = expand_query(question)
+
+    # Retrieve a larger candidate pool (k=8) so re-ranking has more to work with
+    docs = merged_similarity_search(vectorstores, expanded_query, k=8)
+    if not docs:
+        return {"answer": "No relevant context found in the selected documents."}
     # Gather retrieved docs with their session filenames
     docs_with_meta = []
     for sid in data.session_ids:
@@ -279,13 +311,34 @@ def ask_question(request: Request, data: AskRequest):
         page_num = int(raw_page) + 1  # Convert to 1-indexed
         context_parts.append(f"[Page {page_num}] {item['doc'].page_content}")
 
-    context = "\n\n".join(context_parts)
+    # ── Step 2: Re-rank chunks by answer-type relevance ───────────────────────
+    # Promotes chunks whose content FORMAT matches what the question asks for
+    # (e.g. chunk with "69%" ranked above chunk with "45/75" for a % question).
+    docs = rerank_docs(docs, question, top_k=4)
 
-    # Use minimal prompt builder to reduce instruction echoing (upstream fix)
-    prompt = build_ask_prompt(context=context, question=data.question)
-    raw_answer = generate_response(prompt, max_new_tokens=150)
-    # Strip any leaked prompt/context text from the raw output
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    # ── Step 3: Build minimal prompt (short prompt → less instruction echoing) ──
+    # Note: NO format hint injected into the prompt.
+    # flan-t5-base treats format hints literally and outputs just the symbol
+    # (e.g. bare "%"). Numeric disambiguation is handled in Step 5 below.
+    prompt = build_ask_prompt(
+        context=context,
+        question=question,
+        conversation_context=conversation_context,
+    )
+
+    raw_answer   = generate_response(prompt, max_new_tokens=150)
+
+    # ── Step 4: Post-process — strip all prompt echoes / context leakage ───────
     clean_answer = extract_final_answer(raw_answer)
+
+    # ── Step 5: Typed-answer validation / context-extraction fallback ─────────
+    # If the model returned garbage (e.g. bare "%", single char, empty string),
+    # extract the correct value directly from the retrieved context using regex.
+    # Example: question asks for "%" → LLM outputs "%" → we find "69%" in context.
+    clean_answer = extract_typed_answer(clean_answer, question, context)
+
 
     # Build deduplicated, sorted citations
     seen = set()
@@ -332,12 +385,11 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 
     context = "\n\n".join([d.page_content for d in docs])
 
-    # ── Build minimal summarization prompt ───────────────────────────────────
+    # Minimal summarization prompt (no bullet-rule echoing)
     prompt = build_summarize_prompt(context=context)
 
     raw_summary = generate_response(prompt, max_new_tokens=300)
-    # Post-process: strip any leaked prompt/context text from the summary.
-    summary = extract_final_summary(raw_summary)
+    summary     = extract_final_summary(raw_summary)
     return {"summary": summary}
 
 
@@ -366,14 +418,13 @@ def compare_documents(request: Request, data: CompareRequest):
     per_doc_contexts = []
     for i, vs in enumerate(vectorstores):
         chunks = vs.similarity_search(query, k=4)
-        text = "\n".join([c.page_content for c in chunks])
+        text   = "\n".join([c.page_content for c in chunks])
         per_doc_contexts.append(text)
 
-    # ── Build minimal comparison prompt ───────────────────────────────────────
+    # Minimal comparison prompt (no numbered-rule echoing)
     prompt = build_compare_prompt(per_doc_contexts=per_doc_contexts)
 
-    raw = generate_response(prompt, max_new_tokens=400)
-    # Post-process: strip any leaked prompt/context text from the comparison.
+    raw        = generate_response(prompt, max_new_tokens=400)
     comparison = extract_comparison(raw)
     return {"comparison": comparison}
 

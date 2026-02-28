@@ -102,24 +102,13 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   }
 
   const filePath = path.resolve(req.file.path);
-  const uploadDirResolved = path.resolve(UPLOAD_DIR);
-  
-  // SECURITY: Validate that the file path is within UPLOAD_DIR (prevent path traversal)
-  if (!filePath.startsWith(uploadDirResolved + path.sep) && filePath !== uploadDirResolved) {
-    console.error("[/upload] Path traversal attempt detected:", filePath);
-    return res.status(400).json({ error: "Invalid file path." });
-  }
-
   let fileStream;
 
   try {
-    // Create a readable stream from the uploaded file
-    fileStream = fs.createReadStream(filePath);
-    
-    // Use FormData to send multipart data to FastAPI
     const FormData = require("form-data");
     const formData = new FormData();
-    formData.append("file", fileStream);
+    fileStream = fs.createReadStream(filePath);
+    formData.append("file", fileStream, req.file.originalname);
 
     const response = await axios.post(
       `${RAG_URL}/upload`,
@@ -148,7 +137,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     if (fileStream) {
       fileStream.destroy();
     }
-    
+
     // FIX: Delete uploaded file from Node server after processing (Issue #110)
     // This prevents disk space exhaustion from orphaned PDF files
     fs.unlink(filePath, (unlinkErr) => {
@@ -170,19 +159,45 @@ app.post("/ask", askLimiter, async (req, res) => {
   }
 
   try {
-    const response = await axios.post(
-      `${RAG_URL}/ask`,
-      { question, session_ids },
-      { timeout: 180000 }
-    );
+    // Initialize session chat history if it doesn't exist
+    if (!req.session.chatHistory) {
+      req.session.chatHistory = [];
+    }
 
-    return res.json(response.data);
+    // Add user message to session history
+    req.session.chatHistory.push({
+      role: "user",
+      content: question,
+    });
+
+    // Send question + history to FastAPI with session isolation
+    const response = await axios.post("http://localhost:5000/ask", {
+      question: question,
+      session_id: sessionId,
+      history: req.session.chatHistory,
+    });
+
+    // Add assistant response to session history
+    req.session.chatHistory.push({
+      role: "assistant",
+      content: response.data.answer,
+    });
+
+    res.json(response.data);
   } catch (error) {
     console.error("[/ask]", error.response?.data || error.message);
     return res.status(500).json({ error: "Error getting answer." });
   }
+  res.json({ message: "History cleared" });
 });
 
+app.post("/clear-history", (req, res) => {
+  // Clear only this user's session history
+  if (req.session) {
+    req.session.chatHistory = [];
+  }
+  res.json({ message: "History cleared" });
+});
 
 app.post("/summarize", summarizeLimiter, async (req, res) => {
   const { session_ids } = req.body;
