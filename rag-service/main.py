@@ -12,50 +12,67 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from uuid import uuid4
-@app.post("/upload")
-@limiter.limit("10/15 minutes")
-async def upload_file(request: Request, file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        return {"error": "Only PDF files are supported"}
+import os
+import time
+import uuid
+import torch
+import uvicorn
+import pdf2image
+import pytesseract
+from PIL import Image
 
-    session_id = str(uuid4())
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+# ---------------------------------------------------------------------------
+# Utils: post-processing, prompt building, numeric answer disambiguation
+# ---------------------------------------------------------------------------
 
-    try:
-        file_bytes = await file.read()
-        with open(file_path, "wb") as buffer:
-            buffer.write(file_bytes)
+# Post-processing: strip prompt echoes / context leakage from every LLM response.
+from utils.postprocess import extract_final_answer, extract_final_summary, extract_comparison
 
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
+# Minimal prompt builders (short prompts → less instruction echoing by the model).
+from utils.prompt_templates import build_ask_prompt, build_summarize_prompt, build_compare_prompt
 
-        chunk_size = int(os.getenv("PDF_CHUNK_SIZE", 1000))
-        chunk_overlap = int(os.getenv("PDF_CHUNK_OVERLAP", 100))
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
-        )
-        chunks = splitter.split_documents(docs)
-        for i, chunk in enumerate(chunks):
-            page_num = chunk.metadata.get("page", None)
-            chunk.metadata["page_number"] = page_num
-            chunk.metadata["file_name"] = file.filename
+# Query expansion + answer-type chunk re-ranking + typed-answer validation.
+from utils.query_utils import expand_query, rerank_docs, extract_typed_answer, get_answer_type_hint
 
-        vectorstore = FAISS.from_documents(chunks, embedding_model)
+load_dotenv()
 
-        sessions[session_id] = {
-            "vectorstores": [vectorstore],
-            "last_accessed": time.time()
-        }
+app = FastAPI(
+    title="PDF QA Bot API",
+    description="PDF Question-Answering Bot (Session-based, No Auth)",
+    version="2.1.0"
+)
 
-        return {
-            "message": "PDF uploaded and processed",
-            "session_id": session_id
-        }
-    except Exception as e:
-        return {"error": f"Upload failed: {str(e)}"}
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# ===============================
+# SESSION STORAGE (REQUIRED: keep sessionId)
+# ===============================
+# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
+sessions = {}
+SESSION_TIMEOUT = 3600  # 1 hour
+
+# Embedding model (loaded once)
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+# ===============================
+# LOAD GENERATION MODEL ONCE
+# ===============================
+HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+
 config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
 is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
 tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
@@ -70,12 +87,51 @@ if torch.cuda.is_available():
 
 model.eval()
 
+
+
+# ---------------------------------------------------------------------------
+# MODEL GENERATION
+# ---------------------------------------------------------------------------
+
+def generate_response(prompt: str, max_new_tokens: int) -> str:
+    """Run inference with the globally loaded model (no reload per request)."""
+    global generation_tokenizer, generation_model, generation_is_encoder_decoder
+    tokenizer = generation_tokenizer
+    model = generation_model
+    is_encoder_decoder = generation_is_encoder_decoder
+    model_device = next(model.parameters()).device
+
+    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    encoded = {key: value.to(model_device) for key, value in encoded.items()}
+    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **encoded,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_token_id,
+        )
+
+    if is_encoder_decoder:
+        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        return text.strip()
+
+    input_len = encoded["input_ids"].shape[1]
+    new_tokens = generated_ids[0][input_len:]
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
 # ===============================
 # REQUEST MODELS
 # ===============================
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     session_ids: list = []
+    doc_ids: list = []
+    history: list = []
 
 
 class SummarizeRequest(BaseModel):
@@ -155,27 +211,41 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         return {"error": "Upload failed: Invalid file path detected."}
 
     try:
-        file_bytes = await file.read()
         with open(file_path, "wb") as buffer:
-            buffer.write(file_bytes)
+            buffer.write(await file.read())
 
         loader = PyPDFLoader(file_path)
         docs = loader.load()
 
-        # Configurable chunk size and overlap
-        chunk_size = int(os.getenv("PDF_CHUNK_SIZE", 1000))
-        chunk_overlap = int(os.getenv("PDF_CHUNK_OVERLAP", 100))
+        # Check if each page has extractable text
+        final_docs = []
+        images = None
+        
+        for i, doc in enumerate(docs):
+            if len(doc.page_content.strip()) < 50:
+                # Fallback to OCR for this specific page
+                if images is None:
+                    print("Low text content detected on one or more pages. Falling back to OCR...")
+                    images = pdf2image.convert_from_path(file_path)
+                
+                if i < len(images):
+                    ocr_text = pytesseract.image_to_string(images[i])
+                    final_docs.append(Document(
+                        page_content=ocr_text,
+                        metadata={"source": file_path, "page": i}
+                    ))
+                else:
+                    final_docs.append(doc)
+            else:
+                final_docs.append(doc)
+
+        docs = final_docs
+
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
+            chunk_size=1000,
+            chunk_overlap=100
         )
-        # Add metadata (page number, file name) to each chunk
         chunks = splitter.split_documents(docs)
-        for i, chunk in enumerate(chunks):
-            # Try to get page number from source document metadata if available
-            page_num = chunk.metadata.get("page", None)
-            chunk.metadata["page_number"] = page_num
-            chunk.metadata["file_name"] = file.filename
 
         if not chunks:
             return {"error": "Upload failed: No extractable text found in the document (OCR yielded nothing)."}
@@ -219,48 +289,70 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 def ask_question(request: Request, data: AskRequest):
     cleanup_expired_sessions()
 
-    if not data.session_ids:
-        return {"answer": "No session selected.", "citations": []}
+    # Get the first session_id from the list
+    if not data.session_ids or len(data.session_ids) == 0:
+        return {"answer": "No session provided. Please upload a PDF first."}
 
-    # Update last_accessed for all sessions
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            session["last_accessed"] = time.time()
+    session_id = data.session_ids[0]
+    session_data = sessions.get(session_id)
+    if not session_data:
+        return {"answer": "Session expired or no PDF uploaded for this session."}
 
-    # Gather retrieved docs with their session filenames
-    docs_with_meta = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vs = session["vectorstores"][0]
-            filename = session.get("filename", "unknown")
-            retrieved = vs.similarity_search(data.question, k=4)
-            for doc in retrieved:
-                docs_with_meta.append({
-                    "doc": doc,
-                    "filename": filename,
-                    "sid": sid
-                })
+    session_data["last_accessed"] = time.time()
 
-    if not docs_with_meta:
-        return {"answer": "No relevant context found.", "citations": []}
+    vectorstores = get_session_docs(session_id, data.doc_ids)
+    if not vectorstores:
+        return {"answer": "No documents found for the selected session."}
 
-    # Build context with page annotations for the prompt
-    context_parts = []
-    for item in docs_with_meta:
-        # PyPDFLoader sets metadata["page"] as 0-indexed
-        raw_page = item["doc"].metadata.get("page", 0)
-        page_num = int(raw_page) + 1  # Convert to 1-indexed
-        context_parts.append(f"[Page {page_num}] {item['doc'].page_content}")
+    question = data.question
+    history  = data.history
 
-    context = "\n\n".join(context_parts)
+    # Build conversation context (last 5 turns max)
+    conversation_context = ""
+    for msg in history[-5:]:
+        role    = msg.get("role", "")
+        content = msg.get("content", "")
+        conversation_context += f"{role}: {content}\n"
 
-    # Use minimal prompt builder to reduce instruction echoing (upstream fix)
-    prompt = build_ask_prompt(context=context, question=data.question)
-    raw_answer = generate_response(prompt, max_new_tokens=150)
-    # Strip any leaked prompt/context text from the raw output
+    # ── Step 1: Query expansion — cast a wider net for numeric/typed answers ──
+    # e.g. "What is the percentage?" → appends "percentage % score marks grade"
+    expanded_query = expand_query(question)
+
+    # Retrieve a larger candidate pool (k=8) so re-ranking has more to work with
+    docs = merged_similarity_search(vectorstores, expanded_query, k=8)
+    if not docs:
+        return {"answer": "No relevant context found in the selected documents."}
+
+    # ── Step 2: Re-rank chunks by answer-type relevance ───────────────────────
+    # Promotes chunks whose content FORMAT matches what the question asks for
+    # (e.g. chunk with "69%" ranked above chunk with "45/75" for a % question).
+    docs = rerank_docs(docs, question, top_k=4)
+
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    # ── Step 3: Build minimal prompt (short prompt → less instruction echoing) ──
+    # Note: NO format hint injected into the prompt.
+    # flan-t5-base treats format hints literally and outputs just the symbol
+    # (e.g. bare "%"). Numeric disambiguation is handled in Step 5 below.
+    prompt = build_ask_prompt(
+        context=context,
+        question=question,
+        conversation_context=conversation_context,
+    )
+
+    raw_answer   = generate_response(prompt, max_new_tokens=150)
+
+    # ── Step 4: Post-process — strip all prompt echoes / context leakage ───────
     clean_answer = extract_final_answer(raw_answer)
+
+    # ── Step 5: Typed-answer validation / context-extraction fallback ─────────
+    # If the model returned garbage (e.g. bare "%", single char, empty string),
+    # extract the correct value directly from the retrieved context using regex.
+    # Example: question asks for "%" → LLM outputs "%" → we find "69%" in context.
+    clean_answer = extract_typed_answer(clean_answer, question, context)
+
+    return {"answer": clean_answer}
+
 
     # Build deduplicated, sorted citations
     seen = set()
@@ -307,12 +399,11 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 
     context = "\n\n".join([d.page_content for d in docs])
 
-    # ── Build minimal summarization prompt ───────────────────────────────────
+    # Minimal summarization prompt (no bullet-rule echoing)
     prompt = build_summarize_prompt(context=context)
 
     raw_summary = generate_response(prompt, max_new_tokens=300)
-    # Post-process: strip any leaked prompt/context text from the summary.
-    summary = extract_final_summary(raw_summary)
+    summary     = extract_final_summary(raw_summary)
     return {"summary": summary}
 
 
@@ -327,48 +418,35 @@ def compare_documents(request: Request, data: CompareRequest):
     if len(data.session_ids) < 2:
         return {"comparison": "Select at least 2 documents."}
 
-    try:
-        file_bytes = await file.read()
-        with open(file_path, "wb") as buffer:
-            buffer.write(file_bytes)
+    contexts = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vs = session["vectorstores"][0]
+            chunks = vs.similarity_search("main topics", k=4)
+            text = "\n".join([c.page_content for c in chunks])
+            contexts.append(text)
 
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
+    # Retrieve top chunks from each document separately for fair comparison
+    query = "summarize the main topic, purpose, and key details of this document"
+    per_doc_contexts = []
+    for i, vs in enumerate(vectorstores):
+        chunks = vs.similarity_search(query, k=4)
+        text   = "\n".join([c.page_content for c in chunks])
+        per_doc_contexts.append(text)
 
-        # Configurable chunk size and overlap
-        chunk_size = int(os.getenv("PDF_CHUNK_SIZE", 1000))
-        chunk_overlap = int(os.getenv("PDF_CHUNK_OVERLAP", 100))
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
-        )
-        chunks = splitter.split_documents(docs)
+    # Minimal comparison prompt (no numbered-rule echoing)
+    prompt = build_compare_prompt(per_doc_contexts=per_doc_contexts)
 
-        # Ensure overlap and metadata for each chunk
-        for i, chunk in enumerate(chunks):
-            page_num = chunk.metadata.get("page", None)
-            chunk.metadata["page_number"] = page_num
-            chunk.metadata["file_name"] = file.filename
+    raw        = generate_response(prompt, max_new_tokens=400)
+    comparison = extract_comparison(raw)
+    return {"comparison": comparison}
 
-        vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-        sessions[session_id] = {
-            "vectorstores": [vectorstore],
-            "last_accessed": time.time()
-        }
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-        return {
-            "message": "PDF uploaded and processed",
-            "session_id": session_id,
-            "chunk_size": chunk_size,
-            "chunk_overlap": chunk_overlap,
-            "chunks": [
-                {
-                    "page_content": chunk.page_content,
-                    "metadata": chunk.metadata
-                } for chunk in chunks[:5]  # Show first 5 chunks for verification
-            ]
-        }
 
-    except Exception as e:
-        return {"error": f"Upload failed: {str(e)}"}
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=5000)

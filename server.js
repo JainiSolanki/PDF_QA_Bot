@@ -112,6 +112,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 
   let fileStream;
 
+    const filePath = path.join(__dirname, req.file.path);
   try {
     // Create a readable stream from the uploaded file
     fileStream = fs.createReadStream(filePath);
@@ -162,11 +163,18 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 
 
 app.post("/ask", askLimiter, async (req, res) => {
-  const { question, session_ids } = req.body;
+  let { question, sessionId, session_ids } = req.body;
 
   if (!question) return res.status(400).json({ error: "Missing question." });
-  if (!session_ids || session_ids.length === 0) {
-    return res.status(400).json({ error: "Missing session_ids." });
+  
+  // Handle both sessionId (singular) and session_ids (array) formats
+  if (!session_ids && !sessionId) {
+    return res.status(400).json({ error: "Missing sessionId or session_ids." });
+  }
+  
+  // Convert singular sessionId to array format if needed
+  if (sessionId && !session_ids) {
+    session_ids = [sessionId];
   }
 
   try {
