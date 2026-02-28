@@ -214,8 +214,42 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
+        try:
+            from utils.layout_extractor import extract_layout_aware_text
+            docs = extract_layout_aware_text(file_path)
+            
+            # Since layout extractor doesn't explicitly return original page count matching strictly OCR,
+            # we infer page count from metadata.
+            page_count = max([doc.metadata.get("page", 0) for doc in docs]) + 1 if docs else 0
+        except Exception as layout_e:
+            print(f"Layout extractor failed, falling back to PyPDFLoader: {layout_e}")
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            page_count = len(docs)
+    
+            # Check if each page has extractable text
+            final_docs = []
+            images = None
+            
+            for i, doc in enumerate(docs):
+                if len(doc.page_content.strip()) < 50:
+                    # Fallback to OCR for this specific page
+                    if images is None:
+                        print("Low text content detected on one or more pages. Falling back to OCR...")
+                        images = pdf2image.convert_from_path(file_path)
+                    
+                    if i < len(images):
+                        ocr_text = pytesseract.image_to_string(images[i])
+                        final_docs.append(Document(
+                            page_content=ocr_text,
+                            metadata={"source": file_path, "page": i}
+                        ))
+                    else:
+                        final_docs.append(doc)
+                else:
+                    final_docs.append(doc)
+    
+            docs = final_docs
 
         # Check if each page has extractable text
         final_docs = []
@@ -261,7 +295,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         return {
             "message": "PDF uploaded and processed",
             "session_id": session_id,
-            "page_count": len(docs)
+            "page_count": page_count
         }
 
     except Exception as e:
@@ -357,7 +391,9 @@ def ask_question(request: Request, data: AskRequest):
     # Build deduplicated, sorted citations
     seen = set()
     citations = []
-    for item in docs_with_meta:
+    # Filter citations to only matched docs that survived reranking
+    final_docs_with_meta = [item for item in docs_with_meta if item["doc"] in docs]
+    for item in final_docs_with_meta:
         raw_page = item["doc"].metadata.get("page", 0)
         page_num = int(raw_page) + 1
         key = (item["filename"], page_num)
@@ -407,6 +443,52 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     return {"summary": summary}
 
 
+@app.post("/suggest-questions")
+def suggest_questions():
+    global vectorstore, qa_chain
+    
+    if not qa_chain:
+        return {"suggestions": []}
+    
+    try:
+        # Get representative chunks from different parts of document
+        docs = vectorstore.similarity_search("main topics key concepts summary", k=4)
+        context = "\n\n".join([doc.page_content[:500] for doc in docs])
+        
+        prompt = (
+            "Based on this document excerpt, generate 4 specific, useful questions "
+            "that a reader would want answered. Make them clear and concise.\n\n"
+            f"Document content:\n{context}\n\n"
+            "Generate exactly 4 questions (one per line, no numbering):"
+        )
+        
+        response = generate_response(prompt, max_new_tokens=120)
+        
+        # Parse and clean questions
+        questions = [
+            q.strip().lstrip('0123456789.-) ') 
+            for q in response.split('\n') 
+            if q.strip() and len(q.strip()) > 10
+        ][:4]
+        
+        # Return suggestions or fallback questions
+        if questions:
+            return {"suggestions": questions}
+        else:
+            return {"suggestions": [
+                "What are the main topics covered?",
+                "Can you summarize the key points?",
+                "What are the most important findings?",
+                "What conclusions does this document present?"
+            ]}
+    except Exception as e:
+        print(f"Error generating suggestions: {e}")
+        return {"suggestions": [
+            "What are the main topics covered?",
+            "Can you summarize the key points?",
+            "What are the most important findings?",
+            "What conclusions does this document present?"
+        ]}
 # ===============================
 # COMPARE
 # ===============================
