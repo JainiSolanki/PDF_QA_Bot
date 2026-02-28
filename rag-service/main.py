@@ -268,6 +268,7 @@ def validate_embedding_compatibility(session_id: str) -> tuple[bool, str]:
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     session_ids: list = []
+    history: list = []
 
     @validator("question")
     def validate_question(cls, v):
@@ -386,8 +387,42 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             buffer.write(file_bytes)
 
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
+        try:
+            from utils.layout_extractor import extract_layout_aware_text
+            docs = extract_layout_aware_text(file_path)
+            
+            # Since layout extractor doesn't explicitly return original page count matching strictly OCR,
+            # we infer page count from metadata.
+            page_count = max([doc.metadata.get("page", 0) for doc in docs]) + 1 if docs else 0
+        except Exception as layout_e:
+            print(f"Layout extractor failed, falling back to PyPDFLoader: {layout_e}")
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            page_count = len(docs)
+    
+            # Check if each page has extractable text
+            final_docs = []
+            images = None
+            
+            for i, doc in enumerate(docs):
+                if len(doc.page_content.strip()) < 50:
+                    # Fallback to OCR for this specific page
+                    if images is None:
+                        print("Low text content detected on one or more pages. Falling back to OCR...")
+                        images = pdf2image.convert_from_path(file_path)
+                    
+                    if i < len(images):
+                        ocr_text = pytesseract.image_to_string(images[i])
+                        final_docs.append(Document(
+                            page_content=ocr_text,
+                            metadata={"source": file_path, "page": i}
+                        ))
+                    else:
+                        final_docs.append(doc)
+                else:
+                    final_docs.append(doc)
+    
+            docs = final_docs
 
         # Check if each page has extractable text
         final_docs = []
@@ -414,8 +449,9 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         docs = final_docs
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
+            chunk_size=512,
+            chunk_overlap=64,
+            separators=["\n\n", "\n", ". ", " "]
         )
         # Add metadata (page number, file name) to each chunk
         chunks = splitter.split_documents(docs)
@@ -488,6 +524,28 @@ def ask_question(request: Request, data: AskRequest):
                 if not is_compatible:
                     print(f"[EMBEDDING VALIDATION] Session {sid} incompatible: {reason}")
 
+    vectorstores = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vectorstores.extend(session["vectorstores"])
+    if not vectorstores:
+        return {"answer": "No documents found for the selected session."}
+
+    question = data.question
+    history  = data.history
+
+    # Build conversation context (last 5 turns max)
+    conversation_context = ""
+    for msg in history[-5:]:
+        role    = msg.get("role", "")
+        content = msg.get("content", "")
+        conversation_context += f"{role}: {content}\n"
+
+    # ── Step 1: Query expansion — cast a wider net for numeric/typed answers ──
+    # e.g. "What is the percentage?" → appends "percentage % score marks grade"
+    expanded_query = expand_query(question)
+
     # Gather retrieved docs with their session filenames
     docs_with_meta = []
     for sid in data.session_ids:
@@ -514,17 +572,44 @@ def ask_question(request: Request, data: AskRequest):
         page_num = int(raw_page) + 1
         context_parts.append(f"[Page {page_num}] {item['doc'].page_content}")
 
-    context = "\n\n".join(context_parts)
+    # ── Step 2: Re-rank chunks by answer-type relevance ───────────────────────
+    # Promotes chunks whose content FORMAT matches what the question asks for
+    # (e.g. chunk with "69%" ranked above chunk with "45/75" for a % question).
+    docs_to_rerank = [item["doc"] for item in docs_with_meta]
+    docs = rerank_docs(docs_to_rerank, question, top_k=4)
+
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    # ── Step 3: Build minimal prompt (short prompt → less instruction echoing) ──
+    # Note: NO format hint injected into the prompt.
+    # flan-t5-base treats format hints literally and outputs just the symbol
+    # (e.g. bare "%"). Numeric disambiguation is handled in Step 5 below.
+    prompt = build_ask_prompt(
+        context=context,
+        question=question,
+        conversation_context=conversation_context,
+    )
+
+    raw_answer   = generate_response(prompt, max_new_tokens=150)
 
     # Use minimal prompt builder
     prompt = build_ask_prompt(context=context, question=data.question)
     raw_answer = generate_response(prompt, max_new_tokens=150)
     clean_answer = extract_final_answer(raw_answer)
 
+    # ── Step 5: Typed-answer validation / context-extraction fallback ─────────
+    # If the model returned garbage (e.g. bare "%", single char, empty string),
+    # extract the correct value directly from the retrieved context using regex.
+    # Example: question asks for "%" → LLM outputs "%" → we find "69%" in context.
+    clean_answer = extract_typed_answer(clean_answer, question, context)
+
+
     # Build deduplicated, sorted citations
     seen = set()
     citations = []
-    for item in docs_with_meta:
+    # Filter citations to only matched docs that survived reranking
+    final_docs_with_meta = [item for item in docs_with_meta if item["doc"] in docs]
+    for item in final_docs_with_meta:
         raw_page = item["doc"].metadata.get("page", 0)
         page_num = int(raw_page) + 1
         key = (item["filename"], page_num)
