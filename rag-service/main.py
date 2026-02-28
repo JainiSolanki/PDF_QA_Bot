@@ -382,8 +382,9 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         return {"error": "Upload failed: Invalid file path detected."}
 
     try:
+        file_bytes = await file.read()
         with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
+            buffer.write(file_bytes)
 
         loader = PyPDFLoader(file_path)
         docs = loader.load()
@@ -413,10 +414,16 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         docs = final_docs
 
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
         )
+        # Add metadata (page number, file name) to each chunk
         chunks = splitter.split_documents(docs)
+        for i, chunk in enumerate(chunks):
+            # Try to get page number from source document metadata if available
+            page_num = chunk.metadata.get("page", None)
+            chunk.metadata["page_number"] = page_num
+            chunk.metadata["file_name"] = file.filename
 
         if not chunks:
             return {"error": "Upload failed: No extractable text found."}
@@ -579,6 +586,52 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     return {"summary": summary}
 
 
+@app.post("/suggest-questions")
+def suggest_questions():
+    global vectorstore, qa_chain
+    
+    if not qa_chain:
+        return {"suggestions": []}
+    
+    try:
+        # Get representative chunks from different parts of document
+        docs = vectorstore.similarity_search("main topics key concepts summary", k=4)
+        context = "\n\n".join([doc.page_content[:500] for doc in docs])
+        
+        prompt = (
+            "Based on this document excerpt, generate 4 specific, useful questions "
+            "that a reader would want answered. Make them clear and concise.\n\n"
+            f"Document content:\n{context}\n\n"
+            "Generate exactly 4 questions (one per line, no numbering):"
+        )
+        
+        response = generate_response(prompt, max_new_tokens=120)
+        
+        # Parse and clean questions
+        questions = [
+            q.strip().lstrip('0123456789.-) ') 
+            for q in response.split('\n') 
+            if q.strip() and len(q.strip()) > 10
+        ][:4]
+        
+        # Return suggestions or fallback questions
+        if questions:
+            return {"suggestions": questions}
+        else:
+            return {"suggestions": [
+                "What are the main topics covered?",
+                "Can you summarize the key points?",
+                "What are the most important findings?",
+                "What conclusions does this document present?"
+            ]}
+    except Exception as e:
+        print(f"Error generating suggestions: {e}")
+        return {"suggestions": [
+            "What are the main topics covered?",
+            "Can you summarize the key points?",
+            "What are the most important findings?",
+            "What conclusions does this document present?"
+        ]}
 # ===============================
 # COMPARE ENDPOINT
 # ===============================
@@ -627,6 +680,7 @@ def compare_documents(request: Request, data: CompareRequest):
     
     return {"comparison": comparison}
 
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
 
 # ===============================
 # EMBEDDING METADATA DIAGNOSTICS
@@ -668,6 +722,18 @@ def validate_embeddings_endpoint(request: Request, session_id: str = None):
         "action_taken": "validation_required" if not is_compatible else "vectorstore_valid"
     }
 
+        return {
+            "message": "PDF uploaded and processed",
+            "session_id": session_id,
+            "chunk_size": chunk_size,
+            "chunk_overlap": chunk_overlap,
+            "chunks": [
+                {
+                    "page_content": chunk.page_content,
+                    "metadata": chunk.metadata
+                } for chunk in chunks[:5]  # Show first 5 chunks for verification
+            ]
+        }
 
 # ===============================
 # SESSION MANAGEMENT ENDPOINT
