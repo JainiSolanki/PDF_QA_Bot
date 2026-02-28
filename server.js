@@ -2,43 +2,32 @@ const express = require("express");
 const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
-const axiosRetry = require("axios-retry").default;
-const path = require("path");
-const crypto = require("crypto");
-const rateLimit = require("express-rate-limit");
-const { fileTypeFromFile } = require("file-type");
 const fs = require("fs");
+const path = require("path");
+const rateLimit = require("express-rate-limit");
 const session = require("express-session");
 require("dotenv").config();
 
-const app = express();
+const app = express(); // FIX: removed duplicate declaration
 
-// ------------------------------------------------------------------
-// CONFIGURATION
-// ------------------------------------------------------------------
-const API_REQUEST_TIMEOUT = parseInt(
-  process.env.API_REQUEST_TIMEOUT || "45000",
-  10
-);
 
-const MAX_RETRY_ATTEMPTS = parseInt(
-  process.env.MAX_RETRY_ATTEMPTS || "3",
-  10
-);
+const PORT = process.env.PORT || 4000;
+const RAG_URL = process.env.RAG_SERVICE_URL || "http://localhost:5000";
+const SESSION_SECRET = process.env.SESSION_SECRET; // FIX: removed hardcoded secret
 
-// ------------------------------------------------------------------
-// APP SETUP
-// ------------------------------------------------------------------
+if (!SESSION_SECRET) {
+  throw new Error("SESSION_SECRET must be set in environment variables");
+}
+
+
 app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-// ------------------------------------------------------------------
-// SESSION (per-user chat history)
-// ------------------------------------------------------------------
+
 app.use(
   session({
-    secret: "pdf-qa-bot-secret-key",
+    secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: true,
     cookie: {
@@ -48,267 +37,201 @@ app.use(
   })
 );
 
-// ------------------------------------------------------------------
-// AXIOS RETRY CONFIG
-// ------------------------------------------------------------------
-axiosRetry(axios, {
-  retries: MAX_RETRY_ATTEMPTS,
-  retryDelay: axiosRetry.exponentialDelay,
-  retryCondition: (error) =>
-    axiosRetry.isNetworkOrIdempotentRequestError(error) ||
-    error.code === "ECONNABORTED" ||
-    (error.response && error.response.status >= 500),
-});
 
-// ------------------------------------------------------------------
-// RATE LIMITERS
-// ------------------------------------------------------------------
-const uploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-});
+const makeLimiter = (max, msg) =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max,
+    message: msg,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
 
-const askLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-});
+const uploadLimiter = makeLimiter(5, "Too many PDF uploads, try again later.");
+const askLimiter = makeLimiter(30, "Too many questions, try again later.");
+const summarizeLimiter = makeLimiter(10, "Too many summarization requests.");
+const compareLimiter = makeLimiter(10, "Too many comparison requests.");
 
-const summarizeLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-});
 
-const compareLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-});
-
-// ------------------------------------------------------------------
-// FILE STORAGE
-// ------------------------------------------------------------------
 const UPLOAD_DIR = path.resolve(__dirname, "uploads");
 
 if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR);
 }
 
-// ------------------------------------------------------------------
-// MULTER CONFIG
-// ------------------------------------------------------------------
-const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
-
 const storage = multer.diskStorage({
-  destination: "uploads/",
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const uniqueName = `${Date.now()}-${Math.round(
-      Math.random() * 1e9
-    )}${ext}`;
-    cb(null, uniqueName);
+  destination: (_, __, cb) => cb(null, UPLOAD_DIR),
+  filename: (_, file, cb) => {
+    const unique = Date.now() + "-" + file.originalname;
+    cb(null, unique);
   },
 });
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 20 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    if (SUPPORTED_EXTENSIONS.includes(ext)) {
-      cb(null, true);
-    } else {
-      cb(new Error("Unsupported file type"));
-    }
-  },
+const upload = multer({ storage });
+
+
+app.get("/healthz", (req, res) => {
+  res.status(200).json({ status: "healthy", service: "pdf-qa-gateway" });
 });
 
-// ------------------------------------------------------------------
-// ROUTE: UPLOAD
-// ------------------------------------------------------------------
-app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+app.get("/readyz", async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({
-        error: "No file uploaded. Use form field name 'file'.",
+    const response = await axios.get(`${RAG_URL}/healthz`, { timeout: 5000 });
+    if (response.status === 200) {
+      return res.status(200).json({
+        status: "ready",
+        service: "pdf-qa-gateway",
+        dependencies: { rag_service: "healthy" },
       });
     }
-
-    const { sessionId } = req.body;
-    if (!sessionId) {
-      return res.status(400).json({ error: "Missing sessionId." });
-    }
-
-    // **CRITICAL**: Clear session and reset backend state before processing new PDF
-    // This prevents cross-document context leakage
-    if (req.session) {
-      req.session.chatHistory = [];
-      req.session.currentPdfSessionId = null;
-    }
-
-    // Reset backend state through the /reset endpoint
-    try {
-      await axios.post("http://localhost:5000/reset");
-    } catch (resetError) {
-      console.warn("Warning: Could not reset backend state:", resetError.message);
-      // Continue with PDF upload even if reset fails
-    }
-
-    // Send PDF to Python service for processing
-    const uploadResponse = await axios.post("http://localhost:5000/process-pdf", {
-      filePath: filePath,
-    });
-
-    // Store the new PDF session ID for future validation
-    if (uploadResponse.data.session_id && req.session) {
-      req.session.currentPdfSessionId = uploadResponse.data.session_id;
-    }
-
-    res.json({
-      message: "PDF uploaded & processed successfully!",
-      session_id: uploadResponse.data.session_id,
-      details: uploadResponse.data
-    });
-  } catch (err) {
-    console.error("Upload failed:", err.message);
-    res.status(500).json({ error: "Upload failed" });
-  }
-});
-
-// ------------------------------------------------------------------
-// ROUTE: ASK
-// ------------------------------------------------------------------
-app.post("/ask", askLimiter, async (req, res) => {
-  const { question, sessionId } = req.body;
-
-  if (!sessionId)
-    return res.status(400).json({ error: "Missing sessionId." });
-
-  if (!question || typeof question !== "string" || !question.trim())
-    return res.status(400).json({ error: "Invalid question." });
-
-  try {
-    if (!req.session.chatHistory) {
-      req.session.chatHistory = [];
-    }
-
-    req.session.chatHistory.push({
-      role: "user",
-      content: question.trim(),
-    });
-
-    const response = await axios.post(
-      "http://localhost:5000/ask",
-      {
-        question: question.trim(),
-        session_id: sessionId,
-        history: req.session.chatHistory,
-      },
-      { timeout: API_REQUEST_TIMEOUT }
-    );
-
-    req.session.chatHistory.push({
-      role: "assistant",
-      content: response.data.answer,
-    });
-
-    res.json(response.data);
+    throw new Error("RAG unhealthy");
   } catch (error) {
-    console.error("Ask failed:", error.message);
-    res.status(500).json({ error: "Error asking question" });
+    return res.status(503).json({
+      status: "not ready",
+      service: "pdf-qa-gateway",
+      dependencies: { rag_service: "unreachable" },
+    });
   }
 });
 
-// ------------------------------------------------------------------
-// ROUTE: CLEAR HISTORY
-// ------------------------------------------------------------------
-app.post("/clear-history", (req, res) => {
-  if (req.session) {
-    req.session.chatHistory = [];
-    req.session.currentPdfSessionId = null;
+// FIX: Upload endpoint with file cleanup to prevent disk space exhaustion (Issue #110)
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+  // Guard against missing file to avoid accessing properties of undefined
+  if (!req.file || !req.file.path) {
+    return res.status(400).json({ error: "No file uploaded." });
   }
-  res.json({ message: "Chat history cleared" });
-});
 
-app.get("/pdf-status", async (req, res) => {
+  const filePath = path.resolve(req.file.path);
+  const uploadDirResolved = path.resolve(UPLOAD_DIR);
+  
+  // SECURITY: Validate that the file path is within UPLOAD_DIR (prevent path traversal)
+  if (!filePath.startsWith(uploadDirResolved + path.sep) && filePath !== uploadDirResolved) {
+    console.error("[/upload] Path traversal attempt detected:", filePath);
+    return res.status(400).json({ error: "Invalid file path." });
+  }
+
+  let fileStream;
+
   try {
-    // Check backend PDF status
-    const statusResponse = await axios.get("http://localhost:5000/status");
+    // Create a readable stream from the uploaded file
+    fileStream = fs.createReadStream(filePath);
     
-    // Include frontend session status
-    const frontendStatus = {
-      hasSession: !!req.session,
-      hasHistory: req.session?.chatHistory?.length > 0 || false,
-      historyLength: req.session?.chatHistory?.length || 0,
-      currentSessionId: req.session?.currentPdfSessionId || null
-    };
+    // Use FormData to send multipart data to FastAPI
+    const FormData = require("form-data");
+    const formData = new FormData();
+    formData.append("file", fileStream);
 
-    res.json({
-      backend: statusResponse.data,
-      frontend: frontendStatus
-    });
-  } catch (err) {
-    console.error("Error fetching PDF status:", err.message);
-    res.status(500).json({ error: "Could not fetch PDF status" });
-  }
-});
-
-// ------------------------------------------------------------------
-// ROUTE: SUMMARIZE
-// ------------------------------------------------------------------
-app.post("/summarize", summarizeLimiter, async (req, res) => {
-  const { sessionId } = req.body;
-
-  if (!sessionId)
-    return res.status(400).json({ error: "Missing sessionId." });
-
-  try {
     const response = await axios.post(
-      "http://localhost:5000/summarize",
-      { session_id: sessionId },
-      { timeout: API_REQUEST_TIMEOUT }
+      `${RAG_URL}/upload`,
+      formData,
+      {
+        headers: formData.getHeaders(),
+        timeout: 180000,
+      }
     );
 
-    res.json({ summary: response.data.summary });
-  } catch (err) {
-    if (err.code === "ECONNABORTED") {
-      return res.status(504).json({ error: "Summarization timed out" });
+    // Store sessionId returned from FastAPI
+    if (req.session) {
+      req.session.currentSessionId = response.data.session_id;
+      req.session.chatHistory = [];
     }
-    res.status(500).json({ error: "Error summarizing" });
-  }
-});
 
-// ------------------------------------------------------------------
-// ROUTE: COMPARE
-// ------------------------------------------------------------------
-app.post("/compare", compareLimiter, async (req, res) => {
-  try {
-    const response = await axios.post(
-      "http://localhost:5000/compare",
-      req.body,
-      { timeout: API_REQUEST_TIMEOUT }
-    );
-
-    res.json({ comparison: response.data.comparison });
+    return res.json({
+      message: response.data.message,
+      session_id: response.data.session_id,
+    });
   } catch (err) {
-    res.status(500).json({ error: "Error comparing" });
-  }
-});
-
-// ------------------------------------------------------------------
-// ERROR HANDLING
-// ------------------------------------------------------------------
-app.use((err, req, res, next) => {
-  if (err.code === "LIMIT_FILE_SIZE") {
-    return res.status(400).json({
-      error: "File too large (max 20MB).",
+    console.error("[/upload]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Upload failed." });
+  } finally {
+    // SECURITY: Destroy stream to prevent file descriptor leaks (especially on Windows)
+    if (fileStream) {
+      fileStream.destroy();
+    }
+    
+    // FIX: Delete uploaded file from Node server after processing (Issue #110)
+    // This prevents disk space exhaustion from orphaned PDF files
+    fs.unlink(filePath, (unlinkErr) => {
+      if (unlinkErr && unlinkErr.code !== "ENOENT") {
+        // Only log if it's not "file not found" (which is fine)
+        console.warn(`[/upload] Failed to delete file: ${unlinkErr.message}`);
+      }
     });
   }
-  if (err.message.includes("Unsupported file type")) {
-    return res.status(400).json({ error: err.message });
-  }
-  next(err);
 });
 
-// ------------------------------------------------------------------
-app.listen(4000, () =>
-  console.log("Backend running on http://localhost:4000")
+
+app.post("/ask", askLimiter, async (req, res) => {
+  const { question, session_ids } = req.body;
+
+  if (!question) return res.status(400).json({ error: "Missing question." });
+  if (!session_ids || session_ids.length === 0) {
+    return res.status(400).json({ error: "Missing session_ids." });
+  }
+
+  try {
+    const response = await axios.post(
+      `${RAG_URL}/ask`,
+      { question, session_ids },
+      { timeout: 180000 }
+    );
+
+    return res.json(response.data);
+  } catch (error) {
+    console.error("[/ask]", error.response?.data || error.message);
+    return res.status(500).json({ error: "Error getting answer." });
+  }
+});
+
+
+app.post("/summarize", summarizeLimiter, async (req, res) => {
+  const { session_ids } = req.body;
+
+  if (!session_ids || session_ids.length === 0) {
+    return res.status(400).json({ error: "Missing session_ids." });
+  }
+
+  try {
+    const response = await axios.post(
+      `${RAG_URL}/summarize`,
+      { session_ids },
+      { timeout: 180000 }
+    );
+
+    return res.json(response.data);
+  } catch (err) {
+    console.error("[/summarize]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Error summarizing PDF." });
+  }
+});
+
+
+app.post("/compare", compareLimiter, async (req, res) => {
+  const { session_ids } = req.body;
+
+  if (!session_ids || session_ids.length < 2) {
+    return res.status(400).json({ error: "Select at least 2 documents." });
+  }
+
+  try {
+    const response = await axios.post(
+      `${RAG_URL}/compare`,
+      { session_ids },
+      { timeout: 180000 }
+    );
+
+    return res.json(response.data);
+  } catch (err) {
+    console.error("[/compare]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Error comparing documents." });
+  }
+});
+
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+app.listen(PORT, () =>
+  console.log(`Backend running on http://localhost:${PORT}`)
 );
