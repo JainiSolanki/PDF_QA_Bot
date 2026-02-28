@@ -105,15 +105,16 @@ function App() {
   const askQuestion = async () => {
     if (!question.trim() || !sessionId) return;
     setAsking(true);
-    const userMsg = { role: "user", text: question };
+    const userMsg = { id: Date.now(), role: "user", text: question };
     setChat(prev => [...prev, userMsg]);
 
     try {
       const res = await axios.post("http://localhost:4000/ask", {
         question: question.trim(),
-        sessionId: sessionId
+        session_ids: [sessionId]
       });
       setChat(prev => [...prev, {
+        id: Date.now() + 1,
         role: "bot",
         text: res.data.answer,
         citations: res.data.citations || []
@@ -321,7 +322,7 @@ function App() {
             </Typography>
           ) : (
             chat.map((msg, i) => (
-              <Box key={i} display="flex" justifyContent={msg.role === "user" ? "flex-end" : "flex-start"} mb={1}>
+              <Box key={msg.id || `chat-msg-${i}`} display="flex" justifyContent={msg.role === "user" ? "flex-end" : "flex-start"} mb={1}>
                 <Box
                   sx={{
                     bgcolor: msg.role === "user" ? "primary.light" : "grey.200",
@@ -339,7 +340,7 @@ function App() {
                     <Box mt={0.5} display="flex" flexWrap="wrap" gap={0.5}>
                       {msg.citations.map((c, j) => (
                         <Typography
-                          key={j}
+                          key={`cit-${msg.id || i}-${j}`}
                           variant="caption"
                           sx={{ bgcolor: "grey.400", px: 1, py: 0.3, borderRadius: 1, display: "inline-block" }}
                         >

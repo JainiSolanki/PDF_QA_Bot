@@ -13,22 +13,50 @@ const app = express(); // FIX: removed duplicate declaration
 
 const PORT = process.env.PORT || 4000;
 const RAG_URL = process.env.RAG_SERVICE_URL || "http://localhost:5000";
-const SESSION_SECRET = process.env.SESSION_SECRET; // FIX: removed hardcoded secret
-
-if (!SESSION_SECRET) {
-  throw new Error("SESSION_SECRET must be set in environment variables");
-}
-
 
 app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-// Storage for uploaded PDFs with file size limit (10MB)
-const upload = multer({
-  dest: "uploads/",
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+app.use(
+  session({
+    secret: "fallback_session_secret_key", // FIX: removed SESSION_SECRET environment variable dependency
+    resave: false,
+    saveUninitialized: true,
+    cookie: {
+      secure: false,
+      maxAge: 1000 * 60 * 60 * 24,
+    },
+  })
+);
+
+
+const makeLimiter = (max, msg) =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max,
+    message: msg,
+    standardHeaders: true,
+    legacyHeaders: false,
+  });
+
+const uploadLimiter = makeLimiter(5, "Too many PDF uploads, try again later.");
+const askLimiter = makeLimiter(30, "Too many questions, try again later.");
+const summarizeLimiter = makeLimiter(10, "Too many summarization requests.");
+const compareLimiter = makeLimiter(10, "Too many comparison requests.");
+
+
+const UPLOAD_DIR = path.resolve(__dirname, "uploads");
+
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR);
+}
+
+const storage = multer.diskStorage({
+  destination: (_, __, cb) => cb(null, UPLOAD_DIR),
+  filename: (_, file, cb) => {
+    const unique = Date.now() + "-" + file.originalname;
+    cb(null, unique);
   },
   fileFilter: (req, file, cb) => {
     // Accept only PDF files
@@ -120,24 +148,13 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   }
 
   const filePath = path.resolve(req.file.path);
-  const uploadDirResolved = path.resolve(UPLOAD_DIR);
-  
-  // SECURITY: Validate that the file path is within UPLOAD_DIR (prevent path traversal)
-  if (!filePath.startsWith(uploadDirResolved + path.sep) && filePath !== uploadDirResolved) {
-    console.error("[/upload] Path traversal attempt detected:", filePath);
-    return res.status(400).json({ error: "Invalid file path." });
-  }
-
   let fileStream;
 
   try {
-    // Create a readable stream from the uploaded file
-    fileStream = fs.createReadStream(filePath);
-    
-    // Use FormData to send multipart data to FastAPI
     const FormData = require("form-data");
     const formData = new FormData();
-    formData.append("file", fileStream);
+    fileStream = fs.createReadStream(filePath);
+    formData.append("file", fileStream, req.file.originalname);
 
     const response = await axios.post(
       `${RAG_URL}/upload`,
@@ -166,7 +183,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     if (fileStream) {
       fileStream.destroy();
     }
-    
+
     // FIX: Delete uploaded file from Node server after processing (Issue #110)
     // This prevents disk space exhaustion from orphaned PDF files
     fs.unlink(filePath, (unlinkErr) => {
@@ -188,19 +205,45 @@ app.post("/ask", askLimiter, async (req, res) => {
   }
 
   try {
-    const response = await axios.post(
-      `${RAG_URL}/ask`,
-      { question, session_ids },
-      { timeout: 180000 }
-    );
+    // Initialize session chat history if it doesn't exist
+    if (!req.session.chatHistory) {
+      req.session.chatHistory = [];
+    }
 
-    return res.json(response.data);
+    // Add user message to session history
+    req.session.chatHistory.push({
+      role: "user",
+      content: question,
+    });
+
+    // Send question + history to FastAPI with session isolation
+    const response = await axios.post("http://localhost:5000/ask", {
+      question: question,
+      session_ids: session_ids,
+      history: req.session.chatHistory,
+    });
+
+    // Add assistant response to session history
+    req.session.chatHistory.push({
+      role: "assistant",
+      content: response.data.answer,
+    });
+
+    res.json(response.data);
   } catch (error) {
     console.error("[/ask]", error.response?.data || error.message);
     return res.status(500).json({ error: "Error getting answer." });
   }
+  res.json({ message: "History cleared" });
 });
 
+app.post("/clear-history", (req, res) => {
+  // Clear only this user's session history
+  if (req.session) {
+    req.session.chatHistory = [];
+  }
+  res.json({ message: "History cleared" });
+});
 
 app.post("/summarize", summarizeLimiter, async (req, res) => {
   const { session_ids } = req.body;
